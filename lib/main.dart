@@ -35,8 +35,17 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _playing = false;
   bool _captions = true;
   final List<PlatformFile> _media = [];
+  final List<int> _timelineMedia = [];
+  final TextEditingController _promptController = TextEditingController();
+  final Map<String, double> _adjustments = {'Exposure': .58, 'Contrast': .64, 'Saturation': .71};
   String _projectName = 'Summer campaign / v04';
-  int _selectedClip = 0;
+  int _selectedClip = -1;
+
+  @override
+  void dispose() {
+    _promptController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -150,14 +159,17 @@ class _EditorScreenState extends State<EditorScreen> {
           Row(children: [
             const Text('TIMELINE', style: TextStyle(fontSize: 11, letterSpacing: 1.3, color: Colors.white54, fontWeight: FontWeight.w700)),
             const SizedBox(width: 16),
-            const Text('00:12.4', style: TextStyle(fontSize: 12)),
+            Expanded(child: Text(_selectedClip >= 0 && _selectedClip < _timelineMedia.length ? _media[_timelineMedia[_selectedClip]].name : 'No clip selected', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12))),
+            IconButton(visualDensity: VisualDensity.compact, tooltip: 'Move clip left', onPressed: () => _moveSelectedClip(-1), icon: const Icon(Icons.chevron_left, size: 18)),
+            IconButton(visualDensity: VisualDensity.compact, tooltip: 'Move clip right', onPressed: () => _moveSelectedClip(1), icon: const Icon(Icons.chevron_right, size: 18)),
+            IconButton(visualDensity: VisualDensity.compact, tooltip: 'Remove clip', onPressed: _removeSelectedClip, icon: const Icon(Icons.delete_outline, size: 17)),
             const Spacer(),
             IconButton(visualDensity: VisualDensity.compact, onPressed: () => _toast('Timeline zoomed out'), icon: const Icon(Icons.remove, size: 17)),
             const Text('100%', style: TextStyle(fontSize: 11, color: Colors.white54)),
             IconButton(visualDensity: VisualDensity.compact, onPressed: () => _toast('Timeline zoomed in'), icon: const Icon(Icons.add, size: 17)),
           ]),
           const SizedBox(height: 10),
-          _track('VIDEO 1', const Color(0xFF648850), const [0.92, 1.28, .82, 1.05, .72]),
+          _track('VIDEO 1', const Color(0xFF648850), _timelineMedia.isEmpty ? const [0.92, 1.28, .82, 1.05, .72] : List<double>.filled(_timelineMedia.length, 1)),
           const SizedBox(height: 7),
           _track('TEXT', const Color(0xFF8273B7), const [.66, .54, .82, .5]),
           const SizedBox(height: 7),
@@ -174,8 +186,10 @@ class _EditorScreenState extends State<EditorScreen> {
             Row(children: List.generate(widths.length, (i) => Expanded(flex: (widths[i] * 100).round(), child: Container(
               margin: const EdgeInsets.only(right: 3),
               height: 36,
-              decoration: BoxDecoration(color: color.withValues(alpha: .64), borderRadius: BorderRadius.circular(5)),
-            child: label == 'VIDEO 1' ? InkWell(onTap: () => setState(() => _selectedClip++), child: const _MiniThumbnail()) : null,
+              decoration: BoxDecoration(color: color.withValues(alpha: .64), borderRadius: BorderRadius.circular(5), border: Border.all(color: label == 'VIDEO 1' && _selectedClip == i ? const Color(0xFFB8F36B) : Colors.transparent)),
+              child: label == 'VIDEO 1' && _timelineMedia.isNotEmpty
+                  ? InkWell(onTap: () => setState(() => _selectedClip = i), child: Center(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 5), child: Text(_media[_timelineMedia[i]].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 9)))))
+                  : label == 'VIDEO 1' ? const _MiniThumbnail() : null,
             )))),
             Positioned(left: c.maxWidth * .27, top: 0, bottom: 0, child: Container(width: 2, color: const Color(0xFFB8F36B))),
           ]))),
@@ -197,7 +211,7 @@ class _EditorScreenState extends State<EditorScreen> {
             ? GridView.count(padding: const EdgeInsets.symmetric(horizontal: 14), crossAxisCount: 2, mainAxisSpacing: 8, crossAxisSpacing: 8, childAspectRatio: 1.5, children: const [
                 _MediaTile(color: Color(0xFF5D684F), icon: Icons.landscape), _MediaTile(color: Color(0xFF5E625C), icon: Icons.waves), _MediaTile(color: Color(0xFF726250), icon: Icons.wb_twilight), _MediaTile(color: Color(0xFF4B6462), icon: Icons.forest),
               ])
-            : ListView.builder(padding: const EdgeInsets.symmetric(horizontal: 10), itemCount: _media.length, itemBuilder: (context, i) => ListTile(dense: true, leading: const Icon(Icons.video_file_outlined), title: Text(_media[i].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)), subtitle: Text(_fileSize(_media[i].size), style: const TextStyle(fontSize: 10)), onTap: () => setState(() => _selectedClip = i))))),
+            : ListView.builder(padding: const EdgeInsets.symmetric(horizontal: 10), itemCount: _media.length, itemBuilder: (context, i) => ListTile(dense: true, leading: const Icon(Icons.video_file_outlined), title: Text(_media[i].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)), subtitle: Text(_fileSize(_media[i].size), style: const TextStyle(fontSize: 10)), onTap: () => _insertToTimeline(i))))),
       ]);
 
   Widget _inspector() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -205,7 +219,7 @@ class _EditorScreenState extends State<EditorScreen> {
         Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: const Color(0xFF1D211A), border: Border.all(color: const Color(0xFF39442F)), borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('What should we make?', style: TextStyle(fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
-          TextField(maxLines: 3, decoration: InputDecoration(hintText: '“Make this feel like a travel film…”', hintStyle: const TextStyle(fontSize: 12, color: Colors.white38), filled: true, fillColor: const Color(0xFF111310), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none), contentPadding: const EdgeInsets.all(11))),
+          TextField(controller: _promptController, maxLines: 3, decoration: InputDecoration(hintText: '“Make this feel like a travel film…”', hintStyle: const TextStyle(fontSize: 12, color: Colors.white38), filled: true, fillColor: const Color(0xFF111310), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none), contentPadding: const EdgeInsets.all(11))),
           const SizedBox(height: 10),
           SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _generateEdit, icon: const Icon(Icons.auto_awesome, size: 15), label: const Text('Generate edit'))),
         ]))),
@@ -221,12 +235,59 @@ class _EditorScreenState extends State<EditorScreen> {
         const Spacer(),
       ]);
 
-  Widget _mobileTools() => SizedBox(height: 66, child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: ['Edit', 'AI', 'Captions', 'Audio', 'Export'].map((label) => TextButton(onPressed: () => setState(() => _tool = label), child: Text(label, style: TextStyle(color: _tool == label ? const Color(0xFFB8F36B) : Colors.white60)))).toList()));
+  Widget _mobileTools() => SizedBox(height: 66, child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: ['Edit', 'AI', 'Captions', 'Audio', 'Export'].map((label) => TextButton(onPressed: () => _handleMobileTool(label), child: Text(label, style: TextStyle(color: _tool == label ? const Color(0xFFB8F36B) : Colors.white60)))).toList()));
+
+  void _handleMobileTool(String label) {
+    setState(() => _tool = label);
+    switch (label) {
+      case 'AI':
+        showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(title: const Text('AI edit'), content: TextField(controller: _promptController, maxLines: 3, decoration: const InputDecoration(hintText: 'Describe the edit you want')), actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () { Navigator.pop(dialogContext); _generateEdit(); }, child: const Text('Plan edit'))]));
+        break;
+      case 'Captions':
+        setState(() => _captions = !_captions);
+        _toast(_captions ? 'Captions enabled' : 'Captions disabled');
+        break;
+      case 'Audio':
+        _showSuggestion('Audio cleanup', 'Reduce steady background noise, level dialogue, and keep music beneath speech.');
+        break;
+      case 'Export':
+        _showExport();
+        break;
+      default:
+        break;
+    }
+  }
   Widget _panelNav(IconData icon, String label, String? count) => ListTile(dense: true, leading: Icon(icon, size: 19, color: Colors.white70), title: Text(label, style: const TextStyle(fontSize: 13)), trailing: count == null ? null : Text(count, style: const TextStyle(color: Colors.white38, fontSize: 11)));
   Widget _action(IconData icon, String title, String sub, {Widget? trailing, VoidCallback? onTap}) => ListTile(dense: true, onTap: onTap, leading: Icon(icon, color: const Color(0xFFB8F36B), size: 19), title: Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)), subtitle: Text(sub, style: const TextStyle(fontSize: 10, color: Colors.white45)), trailing: trailing);
-  Widget _slider(String name, double value) => Padding(padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4), child: Column(children: [Row(children: [Expanded(child: Text(name, style: const TextStyle(fontSize: 11, color: Colors.white70))), Text('${(value * 100).round()}', style: const TextStyle(fontSize: 10, color: Colors.white38))]), SizedBox(height: 22, child: Slider(value: value, onChanged: (_) {}, activeColor: const Color(0xFFB8F36B)))]));
+  Widget _slider(String name, double value) => Padding(padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4), child: Column(children: [Row(children: [Expanded(child: Text(name, style: const TextStyle(fontSize: 11, color: Colors.white70))), Text('${((_adjustments[name] ?? value) * 100).round()}', style: const TextStyle(fontSize: 10, color: Colors.white38))]), SizedBox(height: 22, child: Slider(value: _adjustments[name] ?? value, onChanged: (next) => setState(() => _adjustments[name] = next), activeColor: const Color(0xFFB8F36B)))]));
   Widget _tag(IconData icon, String text) => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: Colors.black.withValues(alpha: .45), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(icon, size: 13, color: const Color(0xFFB8F36B)), const SizedBox(width: 6), Text(text, style: const TextStyle(fontSize: 10))]));
   void _toast(String message) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), behavior: SnackBarBehavior.floating, duration: const Duration(seconds: 2)));
+
+  void _insertToTimeline(int mediaIndex) {
+    setState(() {
+      _timelineMedia.add(mediaIndex);
+      _selectedClip = _timelineMedia.length - 1;
+    });
+    _toast('Added ${_media[mediaIndex].name} to the timeline');
+  }
+
+  void _moveSelectedClip(int direction) {
+    final destination = _selectedClip + direction;
+    if (_selectedClip < 0 || destination < 0 || destination >= _timelineMedia.length) return;
+    setState(() {
+      final clip = _timelineMedia.removeAt(_selectedClip);
+      _timelineMedia.insert(destination, clip);
+      _selectedClip = destination;
+    });
+  }
+
+  void _removeSelectedClip() {
+    if (_selectedClip < 0 || _selectedClip >= _timelineMedia.length) return;
+    setState(() {
+      _timelineMedia.removeAt(_selectedClip);
+      _selectedClip = _timelineMedia.isEmpty ? -1 : _selectedClip.clamp(0, _timelineMedia.length - 1).toInt();
+    });
+  }
 
   Future<void> _importMedia() async {
     final selection = await FilePicker.platform.pickFiles(
@@ -235,8 +296,10 @@ class _EditorScreenState extends State<EditorScreen> {
     );
     if (selection == null || !mounted) return;
     setState(() {
+      final firstIndex = _media.length;
       _media.addAll(selection.files);
-      _selectedClip = _media.length - selection.files.length;
+      _timelineMedia.addAll(List<int>.generate(selection.files.length, (i) => firstIndex + i));
+      _selectedClip = _timelineMedia.length - 1;
     });
     _toast('Added ${selection.files.length} video${selection.files.length == 1 ? '' : 's'} to your media bin');
   }
@@ -247,9 +310,10 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   void _generateEdit() {
+    final prompt = _promptController.text.trim();
     _showSuggestion('Your edit plan', _media.isEmpty
         ? 'Import your footage first. Then Cut Studio can arrange your clips, tighten the pacing, add captions, and shape the story around your prompt.'
-        : 'Use ${_media.length} imported clip${_media.length == 1 ? '' : 's'} to build a 48 second story. Start with the strongest opening shot, tighten pauses, add captions, and finish on a clean audio fade.');
+        : 'Prompt: ${prompt.isEmpty ? 'Create a polished story from these clips.' : prompt}\n\n${_timelineMedia.length} clip${_timelineMedia.length == 1 ? '' : 's'} are on the timeline. Review the order, trim each shot, and refine the look in the inspector.');
   }
 
   void _showSuggestion(String title, String description) {
