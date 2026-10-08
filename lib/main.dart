@@ -245,7 +245,7 @@ class _EditorScreenState extends State<EditorScreen> {
         ),
       ]);
 
-  Widget _inspector() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+  Widget _inspector() => SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Padding(padding: EdgeInsets.fromLTRB(18, 20, 18, 14), child: Text('AI ASSISTANT', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Color(0xFFB8F36B), fontWeight: FontWeight.bold))),
         Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: const Color(0xFF1D211A), border: Border.all(color: const Color(0xFF39442F)), borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('What should we make?', style: TextStyle(fontWeight: FontWeight.w600)),
@@ -267,8 +267,7 @@ class _EditorScreenState extends State<EditorScreen> {
           Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: RangeSlider(min: 0, max: (_durations[_timelineMedia[_selectedClip]]).clamp(.2, 86400).toDouble(), values: _trimRanges[_timelineMedia[_selectedClip]], labels: RangeLabels('${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s', '${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s'), onChanged: (value) { setState(() { _trimRanges[_timelineMedia[_selectedClip]] = value; _captionSegments.clear(); }); final controller = _previewController; if (controller != null && (controller.value.position < Duration(milliseconds: (value.start * 1000).round()) || controller.value.position > Duration(milliseconds: (value.end * 1000).round()))) controller.seekTo(Duration(milliseconds: (value.start * 1000).round())); })),
         ],
         _slider('Exposure', .58), _slider('Contrast', .64), _slider('Saturation', .71),
-        const Spacer(),
-      ]);
+      ]));
 
   Widget _mobileTools() => SizedBox(height: 66, child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: ['Edit', 'AI', 'Captions', 'Audio', 'Export'].map((label) => TextButton(onPressed: () => _handleMobileTool(label), child: Text(label, style: TextStyle(color: _tool == label ? const Color(0xFFB8F36B) : Colors.white60)))).toList()));
 
