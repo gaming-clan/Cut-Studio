@@ -2,6 +2,13 @@
   "name": "cut-studio-ai-backend",
   "private": true,
   "type": "module",
-  "scripts": {"start": "node server.mjs"},
-  "engines": {"node": ">=20"}
-}
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0"
+  }
+}\n
