@@ -243,7 +243,7 @@ class _EditorScreenState extends State<EditorScreen> {
         const SizedBox(height: 12),
         if (_selectedClip >= 0 && _selectedClip < _timelineMedia.length) ...[
           Padding(padding: const EdgeInsets.symmetric(horizontal: 18), child: Row(children: [const Expanded(child: Text('Trim range', style: TextStyle(fontSize: 11, color: Colors.white70))), Text('${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s — ${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s', style: const TextStyle(fontSize: 10, color: Colors.white38))])),
-          Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: RangeSlider(min: 0, max: (_durations[_timelineMedia[_selectedClip]]).clamp(.2, 86400).toDouble(), values: _trimRanges[_timelineMedia[_selectedClip]], labels: RangeLabels('${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s', '${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s'), onChanged: (value) { setState(() => _trimRanges[_timelineMedia[_selectedClip]] = value); final controller = _previewController; if (controller != null && (controller.value.position < Duration(milliseconds: (value.start * 1000).round()) || controller.value.position > Duration(milliseconds: (value.end * 1000).round()))) controller.seekTo(Duration(milliseconds: (value.start * 1000).round())); })),
+          Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: RangeSlider(min: 0, max: (_durations[_timelineMedia[_selectedClip]]).clamp(.2, 86400).toDouble(), values: _trimRanges[_timelineMedia[_selectedClip]], labels: RangeLabels('${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s', '${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s'), onChanged: (value) { setState(() { _trimRanges[_timelineMedia[_selectedClip]] = value; _captionSegments.clear(); }); final controller = _previewController; if (controller != null && (controller.value.position < Duration(milliseconds: (value.start * 1000).round()) || controller.value.position > Duration(milliseconds: (value.end * 1000).round()))) controller.seekTo(Duration(milliseconds: (value.start * 1000).round())); })),
         ],
         _slider('Exposure', .58), _slider('Contrast', .64), _slider('Saturation', .71),
         const Spacer(),
@@ -280,6 +280,7 @@ class _EditorScreenState extends State<EditorScreen> {
   void _insertToTimeline(int mediaIndex) {
     setState(() {
       _timelineMedia.add(mediaIndex);
+      _captionSegments.clear();
       _selectedClip = _timelineMedia.length - 1;
     });
     _toast('Added ${_media[mediaIndex].name} to the timeline');
@@ -292,6 +293,7 @@ class _EditorScreenState extends State<EditorScreen> {
     setState(() {
       final clip = _timelineMedia.removeAt(_selectedClip);
       _timelineMedia.insert(destination, clip);
+      _captionSegments.clear();
       _selectedClip = destination;
     });
   }
@@ -300,6 +302,7 @@ class _EditorScreenState extends State<EditorScreen> {
     if (_selectedClip < 0 || _selectedClip >= _timelineMedia.length) return;
     setState(() {
       _timelineMedia.removeAt(_selectedClip);
+      _captionSegments.clear();
       _selectedClip = _timelineMedia.isEmpty ? -1 : _selectedClip.clamp(0, _timelineMedia.length - 1).toInt();
     });
     if (_selectedClip >= 0) { _loadPreview(_selectedClip); } else { _previewController?.dispose(); setState(() => _previewController = null); }
@@ -334,6 +337,7 @@ class _EditorScreenState extends State<EditorScreen> {
           _durations.add(duration);
           _trimRanges.add(RangeValues(0, duration > .1 ? duration : .1));
           _timelineMedia.add(index);
+          _captionSegments.clear();
           _selectedClip = _timelineMedia.length - 1;
         });
         imported++;
