@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 void main() => runApp(const CutStudioApp());
 
@@ -34,6 +36,8 @@ class _EditorScreenState extends State<EditorScreen> {
   String _tool = 'Edit';
   bool _playing = false;
   bool _captions = true;
+  bool _aiBusy = false;
+  static const _aiEndpoint = String.fromEnvironment('AI_API_URL', defaultValue: 'http://localhost:8787/api/edit-plan');
   final List<PlatformFile> _media = [];
   final List<int> _timelineMedia = [];
   final TextEditingController _promptController = TextEditingController();
@@ -94,9 +98,9 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(width: 10),
           FilledButton.icon(
             style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB8F36B), foregroundColor: const Color(0xFF171A12)),
-            onPressed: _generateEdit,
-            icon: const Icon(Icons.auto_awesome, size: 16),
-            label: const Text('AI edit'),
+            onPressed: _aiBusy ? null : _generateEdit,
+            icon: Icon(_aiBusy ? Icons.hourglass_top : Icons.auto_awesome, size: 16),
+            label: Text(_aiBusy ? 'Planning…' : 'AI edit'),
           ),
         ]),
       );
@@ -221,13 +225,13 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(height: 10),
           TextField(controller: _promptController, maxLines: 3, decoration: InputDecoration(hintText: '“Make this feel like a travel film…”', hintStyle: const TextStyle(fontSize: 12, color: Colors.white38), filled: true, fillColor: const Color(0xFF111310), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none), contentPadding: const EdgeInsets.all(11))),
           const SizedBox(height: 10),
-          SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _generateEdit, icon: const Icon(Icons.auto_awesome, size: 15), label: const Text('Generate edit'))),
+          SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _aiBusy ? null : _generateEdit, icon: Icon(_aiBusy ? Icons.hourglass_top : Icons.auto_awesome, size: 15), label: Text(_aiBusy ? 'Planning…' : 'Generate edit'))),
         ]))),
         const Padding(padding: EdgeInsets.fromLTRB(18, 24, 18, 8), child: Text('QUICK ACTIONS', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
-        _action(Icons.content_cut, 'Remove silences', 'Tighten the pacing', onTap: () => _showSuggestion('Silence removal', 'Find pauses in dialogue and tighten the cuts while keeping natural breathing room.')),
+        _action(Icons.content_cut, 'Remove silences', 'Tighten the pacing', onTap: () => _runQuickAction('Remove silences', 'Tighten pacing by finding long pauses and suggesting clean trims while preserving natural breaths.')),
         _action(Icons.subtitles, 'Create captions', 'Accurate, styled subtitles', onTap: () => setState(() => _captions = !_captions), trailing: Switch(value: _captions, onChanged: (v) => setState(() => _captions = v))),
-        _action(Icons.graphic_eq, 'Clean up audio', 'Reduce noise, balance levels', onTap: () => _showSuggestion('Audio cleanup', 'Reduce steady background noise, level dialogue, and keep music beneath speech.')),
-        _action(Icons.auto_fix_high, 'Color match', 'Unify every shot', onTap: () => _showSuggestion('Color match', 'Match exposure and white balance across the selected shots, then apply a warm film look.')),
+        _action(Icons.graphic_eq, 'Clean up audio', 'Reduce noise, balance levels', onTap: () => _runQuickAction('Clean up audio', 'Reduce steady background noise, balance dialogue loudness, and keep music beneath speech.')),
+        _action(Icons.auto_fix_high, 'Color match', 'Unify every shot', onTap: () => _runQuickAction('Color match', 'Match exposure and white balance across the selected shots, then suggest a consistent warm film look.')),
         const Divider(height: 26, indent: 18, endIndent: 18),
         const Padding(padding: EdgeInsets.symmetric(horizontal: 18), child: Text('SELECTED CLIP', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
         const SizedBox(height: 12),
@@ -309,19 +313,59 @@ class _EditorScreenState extends State<EditorScreen> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  void _generateEdit() {
-    final prompt = _promptController.text.trim();
-    _showSuggestion('Your edit plan', _media.isEmpty
-        ? 'Import your footage first. Then Cut Studio can arrange your clips, tighten the pacing, add captions, and shape the story around your prompt.'
-        : 'Prompt: ${prompt.isEmpty ? 'Create a polished story from these clips.' : prompt}\n\n${_timelineMedia.length} clip${_timelineMedia.length == 1 ? '' : 's'} are on the timeline. Review the order, trim each shot, and refine the look in the inspector.');
+  void _runQuickAction(String title, String instruction) {
+    _promptController.text = '$title: $instruction';
+    _generateEdit();
   }
 
-  void _showSuggestion(String title, String description) {
-    showDialog<void>(context: context, builder: (context) => AlertDialog(
-      title: Row(children: [const Icon(Icons.auto_awesome, color: Color(0xFFB8F36B)), const SizedBox(width: 10), Text(title)]),
-      content: Text('$description\n\nAI suggestions are previews in this prototype; media processing will be connected in a later build.'),
-      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Got it'))],
-    ));
+  Future<void> _generateEdit() async {
+    if (_aiBusy) return;
+    setState(() => _aiBusy = true);
+    final prompt = _promptController.text.trim().isEmpty
+        ? 'Create a polished story from these clips.'
+        : _promptController.text.trim();
+    final clips = _timelineMedia.map((i) => {
+      'name': _media[i].name,
+      'sizeBytes': _media[i].size,
+    }).toList();
+    try {
+      final response = await http.post(
+        Uri.parse(_aiEndpoint),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'prompt': prompt, 'clips': clips, 'captionsEnabled': _captions}),
+      ).timeout(const Duration(seconds: 60));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final body = jsonDecode(response.body);
+        throw Exception(body is Map ? (body['error'] ?? 'AI request failed') : 'AI request failed');
+      }
+      final plan = jsonDecode(response.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
+        title: Row(children: [const Icon(Icons.auto_awesome, color: Color(0xFFB8F36B)), const SizedBox(width: 10), Expanded(child: Text(plan['title'] as String? ?? 'Your edit plan'))]),
+        content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          Text(plan['summary'] as String? ?? ''),
+          const SizedBox(height: 16),
+          for (final step in (plan['steps'] as List? ?? const []))
+            Padding(padding: const EdgeInsets.only(bottom: 12), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Container(width: 24, height: 24, alignment: Alignment.center, decoration: const BoxDecoration(color: Color(0xFF28321F), shape: BoxShape.circle), child: Text('${step['order']}', style: const TextStyle(color: Color(0xFFB8F36B), fontSize: 11))),
+              const SizedBox(width: 10),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(step['action'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)), const SizedBox(height: 3), Text(step['detail'] ?? '', style: const TextStyle(color: Colors.white60, fontSize: 12))])),
+            ])),
+          const Text('This is an edit plan. The current prototype does not yet apply these steps to footage or render an export.', style: TextStyle(color: Colors.white38, fontSize: 11)),
+        ]))),
+        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Close'))],
+      ));
+    } catch (error) {
+      if (!mounted) return;
+      final message = error.toString().replaceFirst('Exception: ', '');
+      showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
+        title: const Text('AI edit is unavailable'),
+        content: Text('$message\n\nStart the local AI backend with OPENAI_API_KEY set, then try again. For a device or deployed app, set AI_API_URL to a backend URL reachable from that device.'),
+        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('OK'))],
+      ));
+    } finally {
+      if (mounted) setState(() => _aiBusy = false);
+    }
   }
 
   void _showExport() {
