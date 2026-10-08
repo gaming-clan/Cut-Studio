@@ -465,7 +465,9 @@ class _EditorScreenState extends State<EditorScreen> {
               Padding(padding: const EdgeInsets.only(top: 8), child: Text('${_media[_timelineMedia[decision['clipIndex'] as int]].name}  ${decision['keep'] == false ? '· remove' : '· keep ${((decision['outPoint'] as num) - (decision['inPoint'] as num)).toStringAsFixed(1)}s'}\n${decision['reason']}', style: const TextStyle(color: Colors.white70, fontSize: 11))),
           ],
           const SizedBox(height: 8),
-          const Text('AI suggestions are based on sampled frames and, when needed, a transcript. Review before applying.', style: TextStyle(color: Colors.white38, fontSize: 11)),
+          Text(plan['engine'] == 'local'
+              ? 'Generated locally with ${plan['model'] ?? 'LM Studio'}. This model received clip names and technical metadata, not video images or audio; preview every suggested edit.'
+              : 'AI suggestions are based on sampled frames and, when needed, a transcript. Review before applying.', style: const TextStyle(color: Colors.white38, fontSize: 11)),
         ]))),
         actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Keep timeline')), if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) FilledButton(onPressed: () { _applyAiEdits(plan); Navigator.pop(dialogContext); }, child: const Text('Apply suggested cuts'))],
       ));

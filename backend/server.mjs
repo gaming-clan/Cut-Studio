@@ -4,13 +4,15 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pipeline } from 'node:stream/promises';
 import Busboy from 'busboy';
 
 const port = Number(process.env.PORT || 8787);
 const model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const localModel = process.env.LM_STUDIO_MODEL || 'google/gemma-4-e4b';
+const localCli = process.env.LM_STUDIO_CLI || (process.platform === 'win32' ? 'lms.exe' : 'lms');
 const execFileAsync = promisify(execFile);
 const dataRoot = path.resolve(process.env.CUT_STUDIO_DATA || 'data');
 const uploadRoot = path.join(dataRoot, 'uploads');
@@ -50,6 +52,20 @@ async function probe(file) {
 async function ffmpeg(args, options = {}) {
   try { return await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner','-y',...args], { maxBuffer: 12 * 1024 * 1024, ...options }); }
   catch (error) { throw new Error((error.stderr || error.message || 'FFmpeg failed').slice(-3000)); }
+}
+function runLocalChat(prompt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(localCli, ['chat', localModel, '--reasoning', 'off', '-p', prompt, '-s', 'Give one short sentence only. Do not reason aloud.', '--ttl', '3600'], { windowsHide: true });
+    let stdout = '', stderr = '', settled = false;
+    const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(value); };
+    const timer = setTimeout(() => { child.kill(); finish(new Error(`Local model ${localModel} timed out.`)); }, 3 * 60 * 1000);
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 512 * 1024) { child.kill(); finish(new Error('Local model output exceeded 512 KB.')); } });
+    child.stderr.on('data', chunk => { stderr += chunk; if (stderr.length > 512 * 1024) stderr = stderr.slice(-512 * 1024); });
+    child.on('error', error => finish(new Error(`Could not start LM Studio CLI (${localCli}): ${error.message}`)));
+    child.on('close', code => code === 0 ? finish(null, {stdout, stderr}) : finish(new Error(stderr.trim() || `LM Studio CLI exited with code ${code}.`)));
+    child.stdin.end();
+  });
 }
 function assetPath(id) { if (!/^[a-f0-9-]{36}$/.test(String(id))) throw new Error('Invalid media id.'); return path.join(uploadRoot, `${id}.media`); }
 function sendJson(res, status, value) { res.writeHead(status, {'Content-Type':'application/json'}).end(JSON.stringify(value)); }
@@ -131,7 +147,7 @@ const server = createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
   if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, configured: Boolean(process.env.OPENAI_API_KEY)})); return;
+    res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, configured: Boolean(process.env.OPENAI_API_KEY), localModel})); return;
   }
   const mediaMatch = req.url?.match(/^\/api\/media\/([a-f0-9-]{36})$/);
   const exportMatch = req.url?.match(/^\/api\/exports\/([a-f0-9-]{36})$/);
@@ -249,13 +265,13 @@ const server = createServer(async (req, res) => {
   if (req.method !== 'POST' || req.url !== '/api/edit-plan') {
     sendJson(res,404,{error:'Not found'}); return;
   }
-  if (!process.env.OPENAI_API_KEY) {
-    res.writeHead(503, {'Content-Type': 'application/json'}).end(JSON.stringify({error: 'OPENAI_API_KEY is not configured on the backend.'})); return;
-  }
   try {
     let raw = '';
     for await (const chunk of req) { raw += chunk; if (raw.length > 100_000) throw new Error('Request is too large.'); }
     const input = JSON.parse(raw);
+    const useLocal = !process.env.OPENAI_API_KEY;
+    const localToken = process.env.LM_STUDIO_API_TOKEN || process.env.LM_API_TOKEN;
+    const localVision = useLocal && Boolean(localToken);
     const prompt = String(input.prompt || '').slice(0, 4000);
     const clips = Array.isArray(input.clips) ? input.clips.slice(0, 20).map(c => ({assetId:String(c.assetId||''),name:String(c.name||'Clip').slice(0,180),durationSeconds:Number(c.durationSeconds)||0,trimStart:Number(c.trimStart)||0,trimEnd:Number(c.trimEnd)||0})) : [];
     if(!clips.length) throw new Error('Add media to the timeline before asking AI to edit.');
@@ -265,9 +281,32 @@ const server = createServer(async (req, res) => {
       const clip=clips[i]; if(!/^[a-f0-9-]{36}$/.test(clip.assetId)) throw new Error(`Clip ${i+1} has no valid local media asset.`);
       const source=assetPath(clip.assetId), metadata=await probe(source); clip.metadata=metadata;
       const start=Math.max(0,clip.trimStart), end=Math.min(metadata.duration,clip.trimEnd||metadata.duration);
-      const frames=metadata.width?await sampleFrames(source,start,end,2):[];
-      const transcript=wantsTranscript&&metadata.audio?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
+      const frames=(!useLocal||localVision)&&metadata.width?await sampleFrames(source,start,end,2):[];
+      const transcript=!useLocal&&wantsTranscript&&metadata.audio?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
       evidence.push({index:i,name:clip.name,trimStart:start,trimEnd:end,metadata,transcript,frames});
+    }
+    if(useLocal) {
+      if(localVision) {
+        const localContent=[{type:'text',text:`User request: ${prompt}. You may inspect only the labeled sampled frames and media metadata below, not every moment. Do not invent events. Return a concise plan and conservative, reviewable cut decisions in timeline order. Preserve uncertain shots. Captions enabled: ${Boolean(input.captionsEnabled)}.`}];
+        for(const item of evidence){localContent.push({type:'text',text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds. Technical metadata: ${JSON.stringify(item.metadata)}`});for(const frame of item.frames){localContent.push({type:'text',text:`Clip ${item.index} sample at ${frame.time.toFixed(2)} seconds`});localContent.push({type:'image_url',image_url:{url:`data:image/jpeg;base64,${frame.data}`}});}}
+        const base=(process.env.LM_STUDIO_BASE_URL||'http://127.0.0.1:1234/v1').replace(/\/$/,'');
+        const localResponse=await fetch(`${base}/chat/completions`,{method:'POST',headers:{Authorization:`Bearer ${localToken}`,'Content-Type':'application/json'},body:JSON.stringify({model:localModel,messages:[{role:'system',content:'You are Cut Studio, a careful video editor. Never claim an edit was executed.'},{role:'user',content:localContent}],temperature:0.2,max_tokens:1800,response_format:{type:'json_schema',json_schema:{name:'cut_studio_edit_plan',strict:true,schema}}})});
+        const payload=await localResponse.json();
+        if(!localResponse.ok) throw new Error(payload?.error?.message||`LM Studio vision request failed (${localResponse.status}).`);
+        const text=payload.choices?.[0]?.message?.content;
+        if(!text) throw new Error(`Local vision model ${localModel} returned no edit plan.`);
+        const result=JSON.parse(text); result.engine='local'; result.model=localModel;
+        result.editDecisions=(result.editDecisions||[]).filter(d=>Number.isInteger(d.clipIndex)&&d.clipIndex>=0&&d.clipIndex<clips.length).map(d=>{const clip=clips[d.clipIndex],lo=Math.max(0,clip.trimStart),hi=Math.min(clip.durationSeconds,clip.trimEnd||clip.durationSeconds);let a=Math.max(lo,Math.min(hi,Number(d.inPoint))),b=Math.max(lo,Math.min(hi,Number(d.outPoint)));if(b-a<0.3){a=lo;b=hi;}return {...d,position:Math.max(0,Math.min(clips.length-1,Number(d.position)||0)),inPoint:a,outPoint:b};});
+        res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify(result)); return;
+      }
+      const clipSummary=evidence.map(c=>`${c.index}: ${c.name}, ${c.trimEnd-c.trimStart}s, ${c.metadata.width||'audio'}x${c.metadata.height||''}, ${c.metadata.fps||0}fps`).join('; ');
+      const localPrompt=`For this request: "${prompt.slice(0,500)}". Give one practical edit action in under 20 words. You cannot see or hear the clips. Do not invent content or repeat technical metadata. If content is unknown, tell the editor what to review before choosing a cut. Clip facts: ${clipSummary}`;
+      const local = await runLocalChat(localPrompt);
+      const cleaned=(local.stdout||'').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\u001b\][^\u0007]*(?:\u0007|$)/g,'').trim();
+      if(!cleaned) throw new Error(`Local model ${localModel} returned an empty recommendation.`);
+      const summary=cleaned.slice(-1500).trim();
+      const result={title:'Local AI edit plan',summary,steps:[{order:1,action:'Editing recommendation',detail:summary},{order:2,action:'Review and refine',detail:'Preview the full clips, then adjust trims and sequence in the timeline. This local text model did not inspect frames or audio.'}],editDecisions:[],engine:'local',model:localModel};
+      res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(result)); return;
     }
     const content=[{type:'input_text',text:`User request: ${prompt}\nCaptions enabled: ${Boolean(input.captionsEnabled)}. You can inspect only supplied sampled frames and transcript excerpts, not every moment. Samples are approximate. Never invent unseen actions or claim edits were executed. Return cut proposals only when evidence supports them; preserve uncertain clips. Keep in/out within each supplied trim range and at least 0.3 seconds for kept clips. Include a concise practical process and a reason for every proposed cut.`}];
     for(const item of evidence){content.push({type:'input_text',text:`CLIP ${item.index} (${item.name}), trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)}s; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}`});for(const frame of item.frames){content.push({type:'input_text',text:`Sample from clip ${item.index} at source ${frame.time.toFixed(2)}s`});content.push({type:'input_image',image_url:`data:image/jpeg;base64,${frame.data}`,detail:'low'});}}
