@@ -22,8 +22,30 @@ async function probe(file) {
   const { stdout } = await execFileAsync(process.env.FFPROBE_PATH || 'ffprobe', ['-v','error','-show_streams','-show_format','-of','json',file], { maxBuffer: 4 * 1024 * 1024 });
   const value = JSON.parse(stdout);
   const video = value.streams.find(s => s.codec_type === 'video');
-  if (!video) throw new Error('No video stream was found.');
-  return { duration: Number(value.format.duration || video.duration || 0), width: video.width, height: video.height, fps: (video.avg_frame_rate || '0/1').split('/').map(Number).reduce((a,b) => b ? a/b : 0), videoCodec: video.codec_name, audio: value.streams.some(s => s.codec_type === 'audio'), audioCodec: value.streams.find(s => s.codec_type === 'audio')?.codec_name || null, sizeBytes: Number(value.format.size || 0) };
+  const audio = value.streams.find(s => s.codec_type === 'audio');
+  if (!video && !audio) throw new Error('No audio or video stream was found.');
+  const rotation = Number(video?.side_data_list?.find(s => Number.isFinite(Number(s.rotation)))?.rotation || 0);
+  const rotated = Math.abs(rotation) % 180 === 90;
+  const fpsParts = (video?.avg_frame_rate || '0/1').split('/').map(Number);
+  return {
+    duration: Number(value.format.duration || video?.duration || audio?.duration || 0),
+    width: video ? (rotated ? video.height : video.width) : null,
+    height: video ? (rotated ? video.width : video.height) : null,
+    rotation,
+    fps: fpsParts[1] ? fpsParts[0] / fpsParts[1] : 0,
+    videoCodec: video?.codec_name || null,
+    pixelFormat: video?.pix_fmt || null,
+    sampleAspectRatio: video?.sample_aspect_ratio || null,
+    videoDuration: Number(video?.duration || value.format.duration || 0),
+    audio: Boolean(audio),
+    audioCodec: audio?.codec_name || null,
+    audioDuration: Number(audio?.duration || 0),
+    audioChannels: audio?.channels || 0,
+    audioChannelLayout: audio?.channel_layout || null,
+    audioSampleRate: Number(audio?.sample_rate || 0),
+    sizeBytes: Number(value.format.size || 0),
+    container: value.format.format_name || null,
+  };
 }
 async function ffmpeg(args, options = {}) {
   try { return await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner','-y',...args], { maxBuffer: 12 * 1024 * 1024, ...options }); }
@@ -33,16 +55,69 @@ function assetPath(id) { if (!/^[a-f0-9-]{36}$/.test(String(id))) throw new Erro
 function sendJson(res, status, value) { res.writeHead(status, {'Content-Type':'application/json'}).end(JSON.stringify(value)); }
 async function readJson(req, limit=200_000) { let raw=''; for await (const chunk of req) { raw += chunk; if (raw.length > limit) throw new Error('Request is too large.'); } return JSON.parse(raw); }
 
+async function transcribeMedia(source) {
+  const audioDir = await mkdtemp(path.join(tmpdir(), 'cutstudio-caption-'));
+  try {
+    await ffmpeg(['-i', source, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-f', 'segment', '-segment_time', '600', '-reset_timestamps', '1', path.join(audioDir, 'chunk-%03d.mp3')]);
+    const chunks = (await readdir(audioDir)).filter(name => name.endsWith('.mp3')).sort();
+    const segments = [];
+    for (let index = 0; index < chunks.length; index++) {
+      const bytes = await readFile(path.join(audioDir, chunks[index]));
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: 'audio/mpeg' }), chunks[index]);
+      form.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
+      form.append('response_format', 'verbose_json');
+      form.append('timestamp_granularities[]', 'segment');
+      const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: form,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error?.message || 'Transcription failed.');
+      for (const segment of payload.segments || []) segments.push({
+        start: Number(segment.start) + index * 600,
+        end: Number(segment.end) + index * 600,
+        text: String(segment.text || '').trim(),
+      });
+    }
+    return segments;
+  } finally {
+    await rm(audioDir, { recursive: true, force: true });
+  }
+}
+
+async function sampleFrames(source, start, end, count = 2) {
+  const frameDir = await mkdtemp(path.join(tmpdir(), 'cutstudio-frames-'));
+  try {
+    const span = Math.max(0, end - start);
+    const times = span <= 0.25 ? [start] : Array.from({ length: count }, (_, index) => start + span * ((index + 1) / (count + 1)));
+    const frames = [];
+    for (let index = 0; index < times.length; index++) {
+      const output = path.join(frameDir, `frame-${index}.jpg`);
+      await ffmpeg(['-ss', String(times[index]), '-i', source, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '6', output]);
+      frames.push({ time: times[index], data: (await readFile(output)).toString('base64') });
+    }
+    return frames;
+  } finally {
+    await rm(frameDir, { recursive: true, force: true });
+  }
+}
+
 const assetMime = new Map();
 const schema = {
-  type: 'object', additionalProperties: false, required: ['title', 'summary', 'steps'],
+  type: 'object', additionalProperties: false, required: ['title', 'summary', 'steps', 'editDecisions'],
   properties: {
     title: { type: 'string' }, summary: { type: 'string' },
     steps: { type: 'array', items: { type: 'object', additionalProperties: false,
       required: ['order', 'action', 'detail'], properties: {
         order: { type: 'integer' }, action: { type: 'string' }, detail: { type: 'string' }
       } }
-    }
+    },
+    editDecisions: { type: 'array', items: { type: 'object', additionalProperties: false,
+      required: ['clipIndex', 'position', 'keep', 'inPoint', 'outPoint', 'reason'], properties: {
+        clipIndex: { type: 'integer' }, position: { type: 'integer' }, keep: { type: 'boolean' },
+        inPoint: { type: 'number' }, outPoint: { type: 'number' }, reason: { type: 'string' },
+      } }
+    },
   }
 };
 
@@ -68,7 +143,7 @@ const server = createServer(async (req, res) => {
       bb.on('file', (_field, stream, info) => {
         filename = path.basename(info.filename || 'video').slice(0,180);
         const ext=path.extname(filename).toLowerCase();
-        const mimeByExt={'.mp4':'video/mp4','.m4v':'video/mp4','.mov':'video/quicktime','.webm':'video/webm','.mkv':'video/x-matroska','.avi':'video/x-msvideo'};
+        const mimeByExt={'.mp4':'video/mp4','.m4v':'video/mp4','.mov':'video/quicktime','.webm':'video/webm','.mkv':'video/x-matroska','.avi':'video/x-msvideo','.mp3':'audio/mpeg','.wav':'audio/wav','.m4a':'audio/mp4','.aac':'audio/aac','.ogg':'audio/ogg'};
         assetMime.set(id, mimeByExt[ext] || info.mimeType || 'application/octet-stream');
         stream.on('limit', () => { fileError = new Error('Video exceeds the 1 GB upload limit.'); });
         writes.push(pipeline(stream, createWriteStream(file)).catch(error => { fileError = error; }));
@@ -101,29 +176,19 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === 'POST' && req.url === '/api/captions') {
     if (!process.env.OPENAI_API_KEY) { sendJson(res,503,{error:'OPENAI_API_KEY is not configured on the backend.'}); return; }
-    let audioDir;
     try {
       const input=await readJson(req); const source=assetPath(input.assetId); const metadata=await probe(source);
-      audioDir=await mkdtemp(path.join(tmpdir(),'cutstudio-caption-'));
-      await ffmpeg(['-i',source,'-vn','-ac','1','-ar','16000','-b:a','48k','-f','segment','-segment_time','600','-reset_timestamps','1',path.join(audioDir,'chunk-%03d.mp3')]);
-      const chunks=(await readdir(audioDir)).filter(name=>name.endsWith('.mp3')).sort(); const segments=[];
-      for(let index=0;index<chunks.length;index++) {
-        const bytes=await readFile(path.join(audioDir,chunks[index])); const form=new FormData();
-        form.append('file',new Blob([bytes],{type:'audio/mpeg'}),chunks[index]); form.append('model',process.env.TRANSCRIPTION_MODEL||'whisper-1'); form.append('response_format','verbose_json'); form.append('timestamp_granularities[]','segment');
-        const response=await fetch('https://api.openai.com/v1/audio/transcriptions',{method:'POST',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`},body:form}); const payload=await response.json();
-        if(!response.ok) throw new Error(payload?.error?.message||'Transcription failed.');
-        for(const segment of payload.segments||[]) segments.push({start:Number(segment.start)+index*600,end:Number(segment.end)+index*600,text:String(segment.text||'').trim()});
-      }
+      if(!metadata.audio) throw new Error('This media has no audio track to caption.');
+      const segments=await transcribeMedia(source);
       sendJson(res,200,{duration:metadata.duration,segments}); return;
     } catch(error) { sendJson(res,500,{error:error.message||'Caption generation failed.'}); return; }
-    finally { if(audioDir) await rm(audioDir,{recursive:true,force:true}); }
   }
   if (req.method === 'POST' && req.url === '/api/render') {
     let workDir;
     try {
       const input=await readJson(req); const clips=Array.isArray(input.clips)?input.clips:[];
       if(!clips.length||clips.length>100) throw new Error('Add between 1 and 100 clips to the timeline.');
-      const width=input.resolution==='4K'?3840:input.resolution==='720p'?1280:1920; const height=input.resolution==='4K'?2160:input.resolution==='720p'?720:1080;
+      const longSide=input.resolution==='4K'?3840:input.resolution==='720p'?1280:1920; const aspect=input.aspect==='9:16'?'9:16':input.aspect==='1:1'?'1:1':'16:9'; const width=aspect==='9:16'?Math.round(longSide*9/16):longSide; const height=aspect==='16:9'?Math.round(longSide*9/16):longSide;
       workDir=await mkdtemp(path.join(tmpdir(),'cutstudio-render-')); const parts=[]; const renderTimeMap=[]; let sourceTimelineOffset=0, outputTimelineOffset=0;
       for(let i=0;i<clips.length;i++) {
         const clip=clips[i], source=assetPath(clip.assetId), meta=await probe(source), start=Math.max(0,Number(clip.start)||0), end=Math.min(meta.duration,Number(clip.end)||meta.duration);
@@ -149,11 +214,15 @@ const server = createServer(async (req, res) => {
       }
       const list=path.join(workDir,'concat.txt'); await writeFile(list,parts.map(f=>`file '${path.basename(f)}'`).join('\n'));
       const joined=path.join(workDir,'joined.mp4'); await ffmpeg(['-f','concat','-safe','0','-i',list,'-c','copy',joined],{cwd:workDir});
-      const captions=Array.isArray(input.captions)?input.captions.filter(s=>String(s.text||'').trim()):[]; const mappedCaptions=captions.flatMap(c=>renderTimeMap.map(m=>{const start=Math.max(Number(c.start)||0,m.sourceStart),end=Math.min(Number(c.end)||0,m.sourceEnd);return end>start?{...c,start:m.outputStart+(start-m.sourceStart),end:m.outputStart+(end-m.sourceStart)}:null;}).filter(Boolean)); let finalFile=joined;
+      let audioMixed=joined;
+      if(input.musicAssetId){const music=assetPath(input.musicAssetId),mix=path.join(workDir,'music-mix.mp4'),volume=Math.max(0,Math.min(1,Number(input.musicVolume??0.18))),duration=(await probe(joined)).duration,fadeStart=Math.max(0,duration-2);await probe(music);await ffmpeg(['-i',joined,'-stream_loop','-1','-i',music,'-filter_complex',`[1:a:0]volume=${volume},afade=t=in:st=0:d=0.2,afade=t=out:st=${fadeStart}:d=2[m];[0:a:0][m]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.95[a]`,'-map','0:v:0','-map','[a]','-c:v','copy','-c:a','aac','-b:a','192k','-ar','48000','-ac','2','-movflags','+faststart',mix]);audioMixed=mix;}
+      const captions=Array.isArray(input.captions)?input.captions.filter(s=>String(s.text||'').trim()):[]; const mappedCaptions=captions.flatMap(c=>renderTimeMap.map(m=>{const start=Math.max(Number(c.start)||0,m.sourceStart),end=Math.min(Number(c.end)||0,m.sourceEnd);return end>start?{...c,start:m.outputStart+(start-m.sourceStart),end:m.outputStart+(end-m.sourceStart)}:null;}).filter(Boolean)); let finalFile=audioMixed;
       if(mappedCaptions.length) {
         const srt=path.join(workDir,'captions.srt'); const time=n=>{const ms=Math.round(Math.max(0,n)*1000),h=Math.floor(ms/3600000),m=Math.floor(ms%3600000/60000),s=Math.floor(ms%60000/1000),x=ms%1000;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(x).padStart(3,'0')}`};
         await writeFile(srt,mappedCaptions.map((c,i)=>`${i+1}\n${time(c.start)} --> ${time(c.end)}\n${String(c.text).replace(/[<>]/g,'').slice(0,500)}\n`).join('\n'));
-        finalFile=path.join(workDir,'captioned.mp4'); await ffmpeg(['-i',joined,'-i',srt,'-map','0:v:0','-map','0:a:0?','-map','1:0','-c:v','copy','-c:a','copy','-c:s','mov_text','-movflags','+faststart',finalFile]);
+        finalFile=path.join(workDir,'captioned.mp4');
+        if(input.captionMode==='burned') await ffmpeg(['-i',audioMixed,'-vf',`subtitles=${path.basename(srt)}:force_style='FontSize=24,Outline=2,MarginV=48'`,'-c:v','libx264','-preset','veryfast','-crf','20','-c:a','copy','-movflags','+faststart',finalFile],{cwd:workDir});
+        else await ffmpeg(['-i',audioMixed,'-i',srt,'-map','0:v:0','-map','0:a:0?','-map','1:0','-c:v','copy','-c:a','copy','-c:s','mov_text','-movflags','+faststart',finalFile]);
       }
       const id=randomUUID(), destination=path.join(exportRoot,`${id}.mp4`); await pipeline(createReadStream(finalFile),createWriteStream(destination));
       const metadata=await probe(destination); const qc=[];
@@ -161,6 +230,10 @@ const server = createServer(async (req, res) => {
       if(metadata.width!==width||metadata.height!==height) qc.push({severity:'error',message:'Output dimensions do not match the selected export profile.'});
       if(metadata.duration<1) qc.push({severity:'error',message:'Output is unexpectedly short.'});
       if(metadata.videoCodec!=='h264') qc.push({severity:'warning',message:`Video codec is ${metadata.videoCodec}, expected H.264.`});
+      if(Math.abs(metadata.fps-30)>0.1) qc.push({severity:'warning',message:`Output frame rate is ${metadata.fps.toFixed(3)} fps; expected 30 fps.`});
+      if(metadata.pixelFormat!=='yuv420p') qc.push({severity:'warning',message:`Output pixel format is ${metadata.pixelFormat}; yuv420p is the compatibility target.`});
+      if(metadata.audio&&(metadata.audioSampleRate!==48000||metadata.audioChannels!==2)) qc.push({severity:'warning',message:`Audio is ${metadata.audioSampleRate} Hz / ${metadata.audioChannels} channel(s); expected 48000 Hz stereo.`});
+      if(metadata.videoDuration&&metadata.audioDuration&&Math.abs(metadata.videoDuration-metadata.audioDuration)>0.25) qc.push({severity:'warning',message:`Audio/video stream duration differs by ${(metadata.videoDuration-metadata.audioDuration).toFixed(2)}s.`});
       const scan=await ffmpeg(['-i',destination,'-vf','blackdetect=d=2:pix_th=0.10','-af','silencedetect=noise=-45dB:d=3','-f','null','-'],{maxBuffer:16*1024*1024}); const log=scan.stderr||'';
       const black=[...log.matchAll(/black_start: ([0-9.]+).*?black_end: ([0-9.]+)/gs)].map(m=>({start:Number(m[1]),end:Number(m[2])}));
       const silence=[...log.matchAll(/silence_start: ([0-9.]+).*?silence_end: ([0-9.]+)/gs)].map(m=>({start:Number(m[1]),end:Number(m[2])}));
@@ -184,11 +257,23 @@ const server = createServer(async (req, res) => {
     for await (const chunk of req) { raw += chunk; if (raw.length > 100_000) throw new Error('Request is too large.'); }
     const input = JSON.parse(raw);
     const prompt = String(input.prompt || '').slice(0, 4000);
-    const clips = Array.isArray(input.clips) ? input.clips.slice(0, 100).map(c => ({name: String(c.name || 'Clip').slice(0, 180), sizeBytes: Number(c.sizeBytes) || 0, durationSeconds: Number(c.durationSeconds)||0, trimStart: Number(c.trimStart)||0, trimEnd: Number(c.trimEnd)||0})) : [];
-    const instructions = `You are Cut Studio, an assistant that plans practical non-destructive video edits. Return concise actionable steps in timeline order, covering ingest and story assembly, picture, sound, captions, color, quality control, and delivery when relevant. Refer to clips by filename when useful. Do not claim to have inspected video or audio: you only receive filenames and sizes. Do not claim edits were executed. Include sensible stages such as story/pacing, trims, captions, audio, color, and quality control only when relevant. User request: ${prompt}. Captions enabled: ${Boolean(input.captionsEnabled)}. Clip metadata: ${JSON.stringify(clips)}`;
+    const clips = Array.isArray(input.clips) ? input.clips.slice(0, 20).map(c => ({assetId:String(c.assetId||''),name:String(c.name||'Clip').slice(0,180),durationSeconds:Number(c.durationSeconds)||0,trimStart:Number(c.trimStart)||0,trimEnd:Number(c.trimEnd)||0})) : [];
+    if(!clips.length) throw new Error('Add media to the timeline before asking AI to edit.');
+    const wantsTranscript=Boolean(input.includeTranscript)||/dialogue|speech|word|quote|caption|subtitle|transcript/i.test(prompt);
+    const evidence=[];
+    for(let i=0;i<clips.length;i++) {
+      const clip=clips[i]; if(!/^[a-f0-9-]{36}$/.test(clip.assetId)) throw new Error(`Clip ${i+1} has no valid local media asset.`);
+      const source=assetPath(clip.assetId), metadata=await probe(source); clip.metadata=metadata;
+      const start=Math.max(0,clip.trimStart), end=Math.min(metadata.duration,clip.trimEnd||metadata.duration);
+      const frames=metadata.width?await sampleFrames(source,start,end,2):[];
+      const transcript=wantsTranscript&&metadata.audio?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
+      evidence.push({index:i,name:clip.name,trimStart:start,trimEnd:end,metadata,transcript,frames});
+    }
+    const content=[{type:'input_text',text:`User request: ${prompt}\nCaptions enabled: ${Boolean(input.captionsEnabled)}. You can inspect only supplied sampled frames and transcript excerpts, not every moment. Samples are approximate. Never invent unseen actions or claim edits were executed. Return cut proposals only when evidence supports them; preserve uncertain clips. Keep in/out within each supplied trim range and at least 0.3 seconds for kept clips. Include a concise practical process and a reason for every proposed cut.`}];
+    for(const item of evidence){content.push({type:'input_text',text:`CLIP ${item.index} (${item.name}), trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)}s; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}`});for(const frame of item.frames){content.push({type:'input_text',text:`Sample from clip ${item.index} at source ${frame.time.toFixed(2)}s`});content.push({type:'input_image',image_url:`data:image/jpeg;base64,${frame.data}`,detail:'low'});}}
     const ai = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST', headers: {'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json'},
-      body: JSON.stringify({model, input: instructions, text: {format: {type: 'json_schema', name: 'cut_studio_edit_plan', strict: true, schema}}})
+      body: JSON.stringify({model, input:[{role:'user',content}], text: {format: {type: 'json_schema', name: 'cut_studio_edit_plan', strict: true, schema}}})
     });
     const payload = await ai.json();
     if (!ai.ok) {
@@ -197,7 +282,9 @@ const server = createServer(async (req, res) => {
     }
     const text = payload.output_text || payload.output?.flatMap(item => item.content || []).find(item => item.type === 'output_text')?.text;
     if (!text) throw new Error('AI returned no edit plan.');
-    res.writeHead(200, {'Content-Type': 'application/json'}).end(text);
+    const result=JSON.parse(text);
+    result.editDecisions=(result.editDecisions||[]).filter(d=>Number.isInteger(d.clipIndex)&&d.clipIndex>=0&&d.clipIndex<clips.length).map(d=>{const clip=clips[d.clipIndex],lo=Math.max(0,clip.trimStart),hi=Math.min(clip.durationSeconds,clip.trimEnd||clip.durationSeconds);let a=Math.max(lo,Math.min(hi,Number(d.inPoint))),b=Math.max(lo,Math.min(hi,Number(d.outPoint)));if(b-a<0.3){a=lo;b=hi;}return {...d,position:Math.max(0,Math.min(clips.length-1,Number(d.position)||0)),inPoint:a,outPoint:b};});
+    res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(result));
   } catch (error) {
     const status = error instanceof SyntaxError ? 400 : 500;
     res.writeHead(status, {'Content-Type': 'application/json'}).end(JSON.stringify({error: error.message || 'Unable to create an edit plan.'}));

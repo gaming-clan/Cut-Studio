@@ -36,7 +36,6 @@ class EditorScreen extends StatefulWidget {
 
 class _EditorScreenState extends State<EditorScreen> {
   String _tool = 'Edit';
-  bool _playing = false;
   bool _captions = true;
   bool _aiBusy = false;
   bool _mediaBusy = false;
@@ -48,12 +47,17 @@ class _EditorScreenState extends State<EditorScreen> {
   final List<RangeValues> _trimRanges = [];
   final List<Map<String, dynamic>> _captionSegments = [];
   String _exportResolution = '1080p';
+  String _exportAspect = '16:9';
+  String _captionMode = 'soft';
+  String? _musicAssetId;
+  String? _musicFileName;
+  double _musicVolume = .18;
   static const _aiEndpoint = String.fromEnvironment('AI_API_URL', defaultValue: 'http://localhost:8787/api/edit-plan');
   final List<PlatformFile> _media = [];
   final List<int> _timelineMedia = [];
   final TextEditingController _promptController = TextEditingController();
   final Map<String, double> _adjustments = {'Exposure': .58, 'Contrast': .64, 'Saturation': .71};
-  String _projectName = 'Summer campaign / v04';
+  final String _projectName = 'Summer campaign / v04';
   int _selectedClip = -1;
 
   @override
@@ -215,13 +219,30 @@ class _EditorScreenState extends State<EditorScreen> {
         _panelNav(Icons.filter_vintage_outlined, 'Effects', null),
         _panelNav(Icons.subtitles_outlined, 'Captions', null),
         const Divider(height: 30, indent: 18, endIndent: 18),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 18), child: Row(children: [const Text('YOUR MEDIA', style: TextStyle(fontSize: 10, letterSpacing: 1.3, color: Colors.white54, fontWeight: FontWeight.bold)), const Spacer(), IconButton(tooltip: 'Import videos', onPressed: _importMedia, icon: const Icon(Icons.add, size: 18))])),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: 18), child: Row(children: [const Text('YOUR MEDIA', style: TextStyle(fontSize: 10, letterSpacing: 1.3, color: Colors.white54, fontWeight: FontWeight.bold)), const Spacer(), IconButton(tooltip: 'Import music/audio', onPressed: _importAudio, icon: const Icon(Icons.music_note, size: 18)), IconButton(tooltip: 'Import videos', onPressed: _importMedia, icon: const Icon(Icons.add, size: 18))])),
         const SizedBox(height: 12),
-        Expanded(child: _media.isEmpty
-            ? GridView.count(padding: const EdgeInsets.symmetric(horizontal: 14), crossAxisCount: 2, mainAxisSpacing: 8, crossAxisSpacing: 8, childAspectRatio: 1.5, children: const [
-                _MediaTile(color: Color(0xFF5D684F), icon: Icons.landscape), _MediaTile(color: Color(0xFF5E625C), icon: Icons.waves), _MediaTile(color: Color(0xFF726250), icon: Icons.wb_twilight), _MediaTile(color: Color(0xFF4B6462), icon: Icons.forest),
-              ])
-            : ListView.builder(padding: const EdgeInsets.symmetric(horizontal: 10), itemCount: _media.length, itemBuilder: (context, i) => ListTile(dense: true, leading: const Icon(Icons.video_file_outlined), title: Text(_media[i].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)), subtitle: Text(_fileSize(_media[i].size), style: const TextStyle(fontSize: 10)), onTap: () => _insertToTimeline(i))))),
+        Expanded(
+          child: _media.isEmpty
+              ? GridView.count(
+                  padding: const EdgeInsets.symmetric(horizontal: 14), crossAxisCount: 2,
+                  mainAxisSpacing: 8, crossAxisSpacing: 8, childAspectRatio: 1.5,
+                  children: const [
+                    _MediaTile(color: Color(0xFF5D684F), icon: Icons.landscape),
+                    _MediaTile(color: Color(0xFF5E625C), icon: Icons.waves),
+                    _MediaTile(color: Color(0xFF726250), icon: Icons.wb_twilight),
+                    _MediaTile(color: Color(0xFF4B6462), icon: Icons.forest),
+                  ],
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 10), itemCount: _media.length,
+                  itemBuilder: (context, i) => ListTile(
+                    dense: true, leading: const Icon(Icons.video_file_outlined),
+                    title: Text(_media[i].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)),
+                    subtitle: Text(_fileSize(_media[i].size), style: const TextStyle(fontSize: 10)),
+                    onTap: () => _insertToTimeline(i),
+                  ),
+                ),
+        ),
       ]);
 
   Widget _inspector() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -272,7 +293,7 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
   Widget _panelNav(IconData icon, String label, String? count) => ListTile(dense: true, leading: Icon(icon, size: 19, color: Colors.white70), title: Text(label, style: const TextStyle(fontSize: 13)), trailing: count == null ? null : Text(count, style: const TextStyle(color: Colors.white38, fontSize: 11)));
-  Widget _action(IconData icon, String title, String sub, {Widget? trailing, VoidCallback? onTap}) => ListTile(dense: true, onTap: onTap, leading: Icon(icon, color: const Color(0xFFB8F36B), size: 19), title: Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)), subtitle: Text(sub, style: const TextStyle(fontSize: 10, color: Colors.white45)), trailing: trailing);
+  Widget _action(IconData icon, String title, String sub, {Widget? trailing, VoidCallback? onTap}) => ListTile(dense: true, onTap: onTap, leading: Icon(icon, color: const Color(0xFFB8F36B), size: 19), title: Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)), subtitle: Text(sub, style: const TextStyle(fontSize: 10, color: Colors.white38)), trailing: trailing);
   Widget _slider(String name, double value) => Padding(padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4), child: Column(children: [Row(children: [Expanded(child: Text(name, style: const TextStyle(fontSize: 11, color: Colors.white70))), Text('${((_adjustments[name] ?? value) * 100).round()}', style: const TextStyle(fontSize: 10, color: Colors.white38))]), SizedBox(height: 22, child: Slider(value: _adjustments[name] ?? value, onChanged: (next) => setState(() => _adjustments[name] = next), activeColor: const Color(0xFFB8F36B)))]));
   Widget _tag(IconData icon, String text) => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: Colors.black.withValues(alpha: .45), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(icon, size: 13, color: const Color(0xFFB8F36B)), const SizedBox(width: 6), Text(text, style: const TextStyle(fontSize: 10))]));
   void _toast(String message) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), behavior: SnackBarBehavior.floating, duration: const Duration(seconds: 2)));
@@ -351,47 +372,20 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
-  Future<void> _loadPreview(int timelineIndex) async {
-    if (timelineIndex < 0 || timelineIndex >= _timelineMedia.length) return;
-    final mediaIndex = _timelineMedia[timelineIndex];
-    final old = _previewController;
-    _previewController = null;
-    await old?.dispose();
-    final controller = VideoPlayerController.networkUrl(_backendUri('/api/media/${_assetIds[mediaIndex]}'));
-    _previewController = controller;
+  Future<void> _importAudio() async {
+    final selection = await FilePicker.platform.pickFiles(type: FileType.audio, withData: true);
+    if (selection == null || selection.files.isEmpty || !mounted) return;
+    final file = selection.files.first;
     try {
-      await controller.initialize();
-      await controller.setLooping(true);
-      if (mounted && identical(_previewController, controller)) setState(() {});
-    } catch (error) {
-      await controller.dispose();
-      if (identical(_previewController, controller)) _previewController = null;
-      if (mounted) _showError('Preview unavailable', 'The media backend could not decode this video. $error');
-    }
-  }
-
-  void _selectTimelineClip(int index) {
-    if (index < 0 || index >= _timelineMedia.length) return;
-    setState(() => _selectedClip = index);
-    _loadPreview(index);
-  }
-
-  Future<void> _togglePlayback() async {
-    final controller = _previewController;
-    if (controller == null || !controller.value.isInitialized) return;
-    if (controller.value.isPlaying) { await controller.pause(); } else { await controller.play(); }
-    if (mounted) setState(() => _playing = controller.value.isPlaying);
-  }
-
-  String _formatDuration(Duration duration) {
-    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-    final tenths = (duration.inMilliseconds.remainder(1000) / 100).floor();
-    return '$minutes:$seconds.$tenths';
-  }
-
-  void _showError(String title, String message) {
-    showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(title: Text(title), content: SelectableText(message), actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('OK'))]));
+      final bytes = file.bytes;
+      if (bytes == null) throw Exception('Could not read ${file.name}.');
+      final request = http.MultipartRequest('POST', _backendUri('/api/media/import'))..files.add(http.MultipartFile.fromBytes('file', bytes, filename: file.name));
+      final response = await http.Response.fromStream(await request.send().timeout(const Duration(minutes: 5)));
+      final result = jsonDecode(response.body);
+      if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(result['error'] ?? 'Audio import failed.');
+      setState(() { _musicAssetId = result['id'] as String; _musicFileName = file.name; });
+      _toast('Imported ${file.name} as background music');
+    } catch (error) { if (mounted) _showError('Audio import failed', error.toString().replaceFirst('Exception: ', '')); }
   }
 
   String _fileSize(int bytes) {
@@ -418,7 +412,7 @@ class _EditorScreenState extends State<EditorScreen> {
     } catch (error) { await controller.dispose(); if (identical(_previewController, controller)) _previewController = null; if (mounted) _showError('Preview unavailable', 'The media backend could not decode this video. $error'); }
   }
   void _selectTimelineClip(int index) { if (index < 0 || index >= _timelineMedia.length) return; setState(() => _selectedClip = index); _loadPreview(index); }
-  Future<void> _togglePlayback() async { final controller=_previewController; if(controller==null||!controller.value.isInitialized)return; if(controller.value.isPlaying){await controller.pause();}else{await controller.play();} if(mounted)setState(()=>_playing=controller.value.isPlaying); }
+  Future<void> _togglePlayback() async { final controller=_previewController; if(controller==null||!controller.value.isInitialized)return; if(controller.value.isPlaying){await controller.pause();}else{await controller.play();} }
   String _formatDuration(Duration duration) { final m=duration.inMinutes.remainder(60).toString().padLeft(2,'0'),s=duration.inSeconds.remainder(60).toString().padLeft(2,'0'),t=(duration.inMilliseconds.remainder(1000)/100).floor(); return '$m:$s.$t'; }
   void _showError(String title,String message) { showDialog<void>(context:context,builder:(dialogContext)=>AlertDialog(title:Text(title),content:SelectableText(message),actions:[TextButton(onPressed:()=>Navigator.pop(dialogContext),child:const Text('OK'))])); }
 
@@ -434,6 +428,7 @@ class _EditorScreenState extends State<EditorScreen> {
         ? 'Create a polished story from these clips.'
         : _promptController.text.trim();
     final clips = _timelineMedia.map((i) => {
+      'assetId': _assetIds[i],
       'name': _media[i].name,
       'sizeBytes': _media[i].size,
       'durationSeconds': _durations[i],
@@ -463,9 +458,16 @@ class _EditorScreenState extends State<EditorScreen> {
               const SizedBox(width: 10),
               Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(step['action'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)), const SizedBox(height: 3), Text(step['detail'] ?? '', style: const TextStyle(color: Colors.white60, fontSize: 12))])),
             ])),
-          const Text('This is an edit plan. The current prototype does not yet apply these steps to footage or render an export.', style: TextStyle(color: Colors.white38, fontSize: 11)),
+          if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) ...[
+            const Divider(),
+            const Text('SUGGESTED CUTS', style: TextStyle(fontSize: 10, letterSpacing: 1.2, color: Color(0xFFB8F36B), fontWeight: FontWeight.bold)),
+            for (final decision in (plan['editDecisions'] as List))
+              Padding(padding: const EdgeInsets.only(top: 8), child: Text('${_media[_timelineMedia[decision['clipIndex'] as int]].name}  ${decision['keep'] == false ? '· remove' : '· keep ${((decision['outPoint'] as num) - (decision['inPoint'] as num)).toStringAsFixed(1)}s'}\n${decision['reason']}', style: const TextStyle(color: Colors.white70, fontSize: 11))),
+          ],
+          const SizedBox(height: 8),
+          const Text('AI suggestions are based on sampled frames and, when needed, a transcript. Review before applying.', style: TextStyle(color: Colors.white38, fontSize: 11)),
         ]))),
-        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Close'))],
+        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Keep timeline')), if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) FilledButton(onPressed: () { _applyAiEdits(plan); Navigator.pop(dialogContext); }, child: const Text('Apply suggested cuts'))],
       ));
     } catch (error) {
       if (!mounted) return;
@@ -480,11 +482,39 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
+  void _applyAiEdits(Map<String, dynamic> plan) {
+    final decisions = (plan['editDecisions'] as List? ?? const []).cast<Map<String, dynamic>>();
+    if (decisions.isEmpty || _timelineMedia.isEmpty) return;
+    final byClip = <int, Map<String, dynamic>>{for (final decision in decisions) decision['clipIndex'] as int: decision};
+    final ordered = List<int>.generate(_timelineMedia.length, (i) => i);
+    ordered.sort((a, b) => ((byClip[a]?['position'] as int?) ?? a).compareTo((byClip[b]?['position'] as int?) ?? b));
+    final updated = <int>[];
+    for (final clipIndex in ordered) {
+      final decision = byClip[clipIndex];
+      if (decision?['keep'] == false) continue;
+      final mediaIndex = _timelineMedia[clipIndex];
+      if (decision != null) {
+        final low = _trimRanges[mediaIndex].start, high = _trimRanges[mediaIndex].end;
+        final start = ((decision['inPoint'] as num).toDouble()).clamp(low, high).toDouble();
+        final end = ((decision['outPoint'] as num).toDouble()).clamp(start, high).toDouble();
+        if (end - start >= .3) _trimRanges[mediaIndex] = RangeValues(start, end);
+      }
+      updated.add(mediaIndex);
+    }
+    if (updated.isEmpty) { _toast('AI did not recommend any safe cuts; timeline kept.'); return; }
+    setState(() { _timelineMedia..clear()..addAll(updated); _selectedClip = 0; _captionSegments.clear(); });
+    _loadPreview(0);
+    _toast('Applied reviewed AI cuts. Captions cleared because timing changed.');
+  }
+
   void _showExport() {
     showDialog<void>(context: context, builder: (dialogContext) => StatefulBuilder(builder: (context, refresh) => AlertDialog(
       title: const Text('Render and quality check'),
       content: Column(mainAxisSize: MainAxisSize.min, children: [
-        DropdownButtonFormField<String>(value: _exportResolution, decoration: const InputDecoration(labelText: 'Resolution'), items: ['4K', '1080p', '720p'].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(), onChanged: (v) { if(v!=null) { setState(() => _exportResolution=v); refresh((){}); } }),
+        DropdownButtonFormField<String>(initialValue: _exportResolution, decoration: const InputDecoration(labelText: 'Resolution'), items: ['4K', '1080p', '720p'].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(), onChanged: (v) { if(v!=null) { setState(() => _exportResolution=v); refresh((){}); } }),
+        DropdownButtonFormField<String>(initialValue: _exportAspect, decoration: const InputDecoration(labelText: 'Aspect ratio'), items: ['16:9', '9:16', '1:1'].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(), onChanged: (v) { if(v!=null) { setState(() => _exportAspect=v); refresh((){}); } }),
+        DropdownButtonFormField<String>(initialValue: _captionMode, decoration: const InputDecoration(labelText: 'Caption format'), items: const [DropdownMenuItem(value:'soft',child:Text('Selectable subtitles')),DropdownMenuItem(value:'burned',child:Text('Burned into picture'))], onChanged: (v) { if(v!=null) { setState(() => _captionMode=v); refresh((){}); } }),
+        if (_musicAssetId != null) Padding(padding: const EdgeInsets.only(top: 8), child: Column(children:[Row(children:[Expanded(child:Text('Music: ${_musicFileName ?? 'Imported audio'}',overflow:TextOverflow.ellipsis)),IconButton(onPressed:(){setState(()=>_musicAssetId=null);refresh((){});},icon:const Icon(Icons.close,size:16))]),Row(children:[const Text('Music level',style:TextStyle(fontSize:11)),Expanded(child:Slider(value:_musicVolume,min:0,max:1,onChanged:(v){setState(()=>_musicVolume=v);refresh((){});}))])])),
         const SizedBox(height: 12),
         Text(_renderBusy ? 'Rendering, normalizing audio, and checking output…' : 'Cuts are applied in order. The export uses H.264/AAC, your trim and color settings, audio leveling, and generated captions.'),
       ]),
@@ -498,10 +528,10 @@ class _EditorScreenState extends State<EditorScreen> {
     setState(() => _renderBusy = true);
     try {
       final clips = _timelineMedia.map((i) => {
-        'assetId': _assetIds[i], 'start': _trimRanges[i].start, 'end': _trimRanges[i].end, 'removeSilences': _removeSilences, 'removeSilences': _removeSilences,
+        'assetId': _assetIds[i], 'start': _trimRanges[i].start, 'end': _trimRanges[i].end, 'removeSilences': _removeSilences,
         'exposure': _adjustments['Exposure'] ?? .58, 'contrast': _adjustments['Contrast'] ?? .64, 'saturation': _adjustments['Saturation'] ?? .71,
       }).toList();
-      final response = await http.post(_backendUri('/api/render'), headers: {'Content-Type':'application/json'}, body: jsonEncode({'clips':clips,'resolution':_exportResolution,'captions':_captions ? _captionSegments : const []})).timeout(const Duration(minutes: 30));
+      final response = await http.post(_backendUri('/api/render'), headers: {'Content-Type':'application/json'}, body: jsonEncode({'clips':clips,'resolution':_exportResolution,'aspect':_exportAspect,'captionMode':_captionMode,'musicAssetId':_musicAssetId,'musicVolume':_musicVolume,'captions':_captions ? _captionSegments : const []})).timeout(const Duration(minutes: 30));
       final result = jsonDecode(response.body);
       if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(result['error'] ?? 'Render failed.');
       if (!mounted) return;
@@ -539,7 +569,7 @@ class _EditorScreenState extends State<EditorScreen> {
         offset+=trim.end-trim.start;
       }
       if(!mounted) return;
-      setState(()=>{ _captions=true; _captionSegments..clear()..addAll(segments); });
+      setState(() { _captions=true; _captionSegments..clear()..addAll(segments); });
       _toast('Generated ${segments.length} caption segments. Captions will be embedded in the MP4.');
     } catch(error) { if(mounted) _showError('Caption generation failed',error.toString().replaceFirst('Exception: ','')); }
   }
@@ -549,7 +579,7 @@ class _EditorScreenState extends State<EditorScreen> {
 class _MiniThumbnail extends StatelessWidget {
   const _MiniThumbnail();
   @override
-  Widget build(BuildContext context) => ClipRRect(borderRadius: BorderRadius.circular(5), child: Row(children: List.generate(8, (i) => Expanded(child: Container(color: Color.lerp(const Color(0xFF506047), const Color(0xFFB29A69), i / 8)))));
+  Widget build(BuildContext context) => ClipRRect(borderRadius: BorderRadius.circular(5), child: Row(children: List.generate(8, (i) => Expanded(child: Container(color: Color.lerp(const Color(0xFF506047), const Color(0xFFB29A69), i / 8))))));
 }
 
 class _MediaTile extends StatelessWidget {
