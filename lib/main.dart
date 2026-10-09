@@ -41,6 +41,8 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _mediaBusy = false;
   bool _renderBusy = false;
   bool _removeSilences = false;
+  String _providerLabel = 'Checking…';
+  final TextEditingController _apiKeyController = TextEditingController();
   VideoPlayerController? _previewController;
   final List<String> _assetIds = [];
   final List<double> _durations = [];
@@ -61,8 +63,15 @@ class _EditorScreenState extends State<EditorScreen> {
   int _selectedClip = -1;
 
   @override
+  void initState() {
+    super.initState();
+    _loadProviderStatus();
+  }
+
+  @override
   void dispose() {
     _promptController.dispose();
+    _apiKeyController.dispose();
     _previewController?.dispose();
     super.dispose();
   }
@@ -110,6 +119,7 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(width: 8),
           const Text('Saved', style: TextStyle(color: Colors.white54, fontSize: 12)),
           const SizedBox(width: 20),
+          IconButton(tooltip: 'AI provider and API key', onPressed: _showProviderSettings, icon: const Icon(Icons.key_outlined)),
           OutlinedButton.icon(onPressed: _showExport, icon: const Icon(Icons.ios_share, size: 16), label: const Text('Export')),
           const SizedBox(width: 10),
           FilledButton.icon(
@@ -420,6 +430,74 @@ class _EditorScreenState extends State<EditorScreen> {
     _generateEdit();
   }
 
+  String? _detectProvider(String key) {
+    if (key.startsWith('sk-ant-')) return 'Anthropic';
+    if (key.startsWith('sk-or-v1-')) return 'OpenRouter';
+    if (key.startsWith('gsk_')) return 'Groq';
+    if (RegExp(r'^AIza[\w-]{20,}$').hasMatch(key)) return 'Google Gemini';
+    if (key.startsWith('xai-')) return 'xAI';
+    if (key.startsWith('sk-')) return 'OpenAI';
+    return null;
+  }
+
+  Future<void> _loadProviderStatus() async {
+    try {
+      final response = await http.get(_backendUri('/api/settings/provider-key')).timeout(const Duration(seconds: 5));
+      if (response.statusCode != 200) return;
+      final status = jsonDecode(response.body) as Map<String, dynamic>;
+      if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
+    } catch (_) {
+      if (mounted) setState(() => _providerLabel = 'Backend offline');
+    }
+  }
+
+  Future<void> _showProviderSettings() async {
+    _apiKeyController.clear();
+    var detected = _detectProvider(_apiKeyController.text);
+    var busy = false;
+    String? error;
+    await showDialog<void>(context: context, builder: (dialogContext) => StatefulBuilder(builder: (context, refresh) => AlertDialog(
+      title: const Text('AI provider and API key'),
+      content: SizedBox(width: 440, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Current: $_providerLabel', style: const TextStyle(color: Color(0xFFB8F36B), fontWeight: FontWeight.w600)),
+        const SizedBox(height: 14),
+        TextField(controller: _apiKeyController, obscureText: true, autocorrect: false, enableSuggestions: false, decoration: const InputDecoration(labelText: 'Provider API key', hintText: 'Paste an API key', border: OutlineInputBorder()), onChanged: (value) => refresh(() => detected = _detectProvider(value.trim()))),
+        const SizedBox(height: 8),
+        Text(detected == null ? 'Supported: OpenAI, Anthropic, Gemini, Groq, OpenRouter, xAI' : 'Detected provider: $detected', style: TextStyle(fontSize: 12, color: detected == null ? Colors.white54 : const Color(0xFFB8F36B))),
+        const SizedBox(height: 10),
+        const Text('The key is sent only to your configured Cut Studio backend and held in its memory. It is not saved to disk and is cleared when the backend restarts. Without a provider key (or OPENAI_API_KEY environment key), AI planning uses your local LM Studio model.', style: TextStyle(fontSize: 12, color: Colors.white60)),
+        if (error != null) ...[const SizedBox(height: 10), Text(error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12))],
+      ])),
+      actions: [
+        TextButton(onPressed: busy ? null : () async {
+          refresh(() { busy = true; error = null; });
+          try {
+            final response = await http.delete(_backendUri('/api/settings/provider-key')).timeout(const Duration(seconds: 10));
+            if (response.statusCode < 200 || response.statusCode >= 300) throw Exception('Could not clear the provider key.');
+            final status = jsonDecode(response.body) as Map<String, dynamic>;
+            if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
+            if (dialogContext.mounted) Navigator.pop(dialogContext);
+          } catch (e) { refresh(() { error = e.toString().replaceFirst('Exception: ', ''); busy = false; }); }
+        }, child: const Text('Clear saved key')),
+        TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+        FilledButton(onPressed: busy || detected == null || _apiKeyController.text.trim().isEmpty ? null : () async {
+          refresh(() { busy = true; error = null; });
+          try {
+            final response = await http.post(_backendUri('/api/settings/provider-key'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'apiKey': _apiKeyController.text.trim()})).timeout(const Duration(seconds: 10));
+            final body = jsonDecode(response.body);
+            if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(body is Map ? body['error'] ?? 'Could not save the key.' : 'Could not save the key.');
+            final status = body as Map<String, dynamic>;
+            _apiKeyController.clear();
+            if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
+            if (dialogContext.mounted) Navigator.pop(dialogContext);
+            if (mounted) _toast('Using $_providerLabel for AI requests.');
+          } catch (e) { refresh(() { error = e.toString().replaceFirst('Exception: ', ''); busy = false; }); }
+        }, child: Text(busy ? 'Saving…' : 'Save key')),
+      ],
+    )));
+    _apiKeyController.clear();
+  }
+
   Future<void> _generateEdit() async {
     if (_aiBusy) return;
     setState(() => _aiBusy = true);
@@ -466,7 +544,7 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(height: 8),
           Text(plan['engine'] == 'local'
               ? 'Generated locally with ${plan['model'] ?? 'LM Studio'}. This model received clip names and technical metadata, not video images or audio; preview every suggested edit.'
-              : 'AI suggestions are based on sampled frames and, when needed, a transcript. Review before applying.', style: const TextStyle(color: Colors.white38, fontSize: 11)),
+              : 'Generated with ${plan['provider'] ?? _providerLabel}. AI suggestions are based on sampled frames and, when supported and needed, a transcript. Review before applying.', style: const TextStyle(color: Colors.white38, fontSize: 11)),
         ]))),
         actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Keep timeline')), if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) FilledButton(onPressed: () { _applyAiEdits(plan); Navigator.pop(dialogContext); }, child: const Text('Apply suggested cuts'))],
       ));
@@ -475,7 +553,7 @@ class _EditorScreenState extends State<EditorScreen> {
       final message = error.toString().replaceFirst('Exception: ', '');
       showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
         title: const Text('AI edit is unavailable'),
-        content: Text('$message\n\nStart the local AI backend with OPENAI_API_KEY set, then try again. For a device or deployed app, set AI_API_URL to a backend URL reachable from that device.'),
+        content: Text('$message\n\nOpen AI provider settings to add a supported API key, or start LM Studio for local AI planning. For a device or deployed app, set AI_API_URL to a backend URL reachable from that device.'),
         actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('OK'))],
       ));
     } finally {

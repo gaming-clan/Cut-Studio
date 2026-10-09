@@ -14,6 +14,43 @@ const model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 const localModel = process.env.LM_STUDIO_MODEL || 'google/gemma-4-e4b';
 const localCli = process.env.LM_STUDIO_CLI || (process.platform === 'win32' ? 'lms.exe' : 'lms');
 const execFileAsync = promisify(execFile);
+const providerDetails = {
+  openai: {label:'OpenAI', model, captions:true},
+  anthropic: {label:'Anthropic', model:'claude-haiku-4-5-20251001', captions:false},
+  gemini: {label:'Google Gemini', model:'gemini-3.8-flash', captions:false},
+  groq: {label:'Groq', model:'qwen/qwen3.6-27b', captions:true},
+  openrouter: {label:'OpenRouter', model:'openai/gpt-4.1-mini', captions:false},
+  xai: {label:'xAI', model:'grok-4.3', captions:false},
+};
+let byokConfig = null;
+function detectProvider(key) {
+  if (/^sk-ant-/.test(key)) return 'anthropic';
+  if (/^sk-or-v1-/.test(key)) return 'openrouter';
+  if (/^gsk_/.test(key)) return 'groq';
+  if (/^AIza[\w-]{20,}$/.test(key)) return 'gemini';
+  if (/^xai-/.test(key)) return 'xai';
+  if (/^sk-(?:proj-|svcacct-|admin-|)/.test(key)) return 'openai';
+  return null;
+}
+function activeProvider() {
+  if (byokConfig) return byokConfig;
+  if (process.env.OPENAI_API_KEY) return {provider:'openai',key:process.env.OPENAI_API_KEY,model};
+  return null;
+}
+function providerStatus() {
+  const config=activeProvider();
+  return config ? {configured:true,provider:config.provider,label:providerDetails[config.provider].label,supportsCaptions:providerDetails[config.provider].captions} : {configured:false,provider:null,label:'Local LM Studio',supportsCaptions:false};
+}
+function geminiSchema(source) {
+  const types={object:'OBJECT',array:'ARRAY',string:'STRING',number:'NUMBER',integer:'INTEGER',boolean:'BOOLEAN'};
+  const target={type:types[source.type]||'STRING'};
+  if(source.properties) target.properties=Object.fromEntries(Object.entries(source.properties).map(([key,value])=>[key,geminiSchema(value)]));
+  if(source.required) target.required=source.required;
+  if(source.items) target.items=geminiSchema(source.items);
+  if(source.enum) target.enum=source.enum;
+  if(source.description) target.description=source.description;
+  return target;
+}
 const dataRoot = path.resolve(process.env.CUT_STUDIO_DATA || 'data');
 const uploadRoot = path.join(dataRoot, 'uploads');
 const exportRoot = path.join(dataRoot, 'exports');
@@ -72,6 +109,8 @@ function sendJson(res, status, value) { res.writeHead(status, {'Content-Type':'a
 async function readJson(req, limit=200_000) { let raw=''; for await (const chunk of req) { raw += chunk; if (raw.length > limit) throw new Error('Request is too large.'); } return JSON.parse(raw); }
 
 async function transcribeMedia(source) {
+  const config=activeProvider();
+  if(!config||!providerDetails[config.provider].captions) throw new Error('Automatic captions are available with OpenAI or Groq keys.');
   const audioDir = await mkdtemp(path.join(tmpdir(), 'cutstudio-caption-'));
   try {
     await ffmpeg(['-i', source, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-f', 'segment', '-segment_time', '600', '-reset_timestamps', '1', path.join(audioDir, 'chunk-%03d.mp3')]);
@@ -81,11 +120,12 @@ async function transcribeMedia(source) {
       const bytes = await readFile(path.join(audioDir, chunks[index]));
       const form = new FormData();
       form.append('file', new Blob([bytes], { type: 'audio/mpeg' }), chunks[index]);
-      form.append('model', process.env.TRANSCRIPTION_MODEL || 'whisper-1');
+      form.append('model', config.provider==='groq'?'whisper-large-v3-turbo':(process.env.TRANSCRIPTION_MODEL||'whisper-1'));
       form.append('response_format', 'verbose_json');
       form.append('timestamp_granularities[]', 'segment');
-      const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: form,
+      const transcriptionUrl=config.provider==='groq'?'https://api.groq.com/openai/v1/audio/transcriptions':'https://api.openai.com/v1/audio/transcriptions';
+      const response = await fetch(transcriptionUrl, {
+        method: 'POST', headers: { Authorization: `Bearer ${config.key}` }, body: form,
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload?.error?.message || 'Transcription failed.');
@@ -144,10 +184,25 @@ const server = createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin',origin); res.setHeader('Vary','Origin');
   } else if(origin) { res.writeHead(403).end('Origin not allowed'); return; }
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
   if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, configured: Boolean(process.env.OPENAI_API_KEY), localModel})); return;
+    res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, ...providerStatus(), localModel})); return;
+  }
+  if (req.url === '/api/settings/provider-key' && req.method === 'GET') {
+    sendJson(res,200,providerStatus()); return;
+  }
+  if (req.url === '/api/settings/provider-key' && req.method === 'DELETE') {
+    byokConfig=null; sendJson(res,200,providerStatus()); return;
+  }
+  if (req.url === '/api/settings/provider-key' && req.method === 'POST') {
+    try {
+      const input=await readJson(req,10_000), key=String(input.apiKey||'').trim();
+      const provider=detectProvider(key);
+      if(!provider) { sendJson(res,422,{error:'Could not identify this key. Supported key formats: OpenAI, Anthropic, Gemini, Groq, OpenRouter, and xAI.'}); return; }
+      byokConfig={provider,key,model:String(input.model||providerDetails[provider].model).slice(0,160)};
+      sendJson(res,200,providerStatus()); return;
+    } catch(error) { sendJson(res,400,{error:error.message||'Unable to configure provider.'}); return; }
   }
   const mediaMatch = req.url?.match(/^\/api\/media\/([a-f0-9-]{36})$/);
   const exportMatch = req.url?.match(/^\/api\/exports\/([a-f0-9-]{36})$/);
@@ -191,7 +246,8 @@ const server = createServer(async (req, res) => {
     } catch(error) { sendJson(res,400,{error:error.message}); return; }
   }
   if (req.method === 'POST' && req.url === '/api/captions') {
-    if (!process.env.OPENAI_API_KEY) { sendJson(res,503,{error:'OPENAI_API_KEY is not configured on the backend.'}); return; }
+    const captionProvider=activeProvider();
+    if (!captionProvider||!providerDetails[captionProvider.provider].captions) { sendJson(res,503,{error:'Automatic captions require an OpenAI or Groq API key. Set one in AI Provider Settings.'}); return; }
     try {
       const input=await readJson(req); const source=assetPath(input.assetId); const metadata=await probe(source);
       if(!metadata.audio) throw new Error('This media has no audio track to caption.');
@@ -269,7 +325,8 @@ const server = createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) { raw += chunk; if (raw.length > 100_000) throw new Error('Request is too large.'); }
     const input = JSON.parse(raw);
-    const useLocal = !process.env.OPENAI_API_KEY;
+    const aiConfig = activeProvider();
+    const useLocal = !aiConfig;
     const localToken = process.env.LM_STUDIO_API_TOKEN || process.env.LM_API_TOKEN;
     const localVision = useLocal && Boolean(localToken);
     const prompt = String(input.prompt || '').slice(0, 4000);
@@ -282,7 +339,7 @@ const server = createServer(async (req, res) => {
       const source=assetPath(clip.assetId), metadata=await probe(source); clip.metadata=metadata;
       const start=Math.max(0,clip.trimStart), end=Math.min(metadata.duration,clip.trimEnd||metadata.duration);
       const frames=(!useLocal||localVision)&&metadata.width?await sampleFrames(source,start,end,2):[];
-      const transcript=!useLocal&&wantsTranscript&&metadata.audio?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
+      const transcript=aiConfig&&wantsTranscript&&metadata.audio&&providerDetails[aiConfig.provider].captions?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
       evidence.push({index:i,name:clip.name,trimStart:start,trimEnd:end,metadata,transcript,frames});
     }
     if(useLocal) {
@@ -310,18 +367,38 @@ const server = createServer(async (req, res) => {
     }
     const content=[{type:'input_text',text:`User request: ${prompt}\nCaptions enabled: ${Boolean(input.captionsEnabled)}. You can inspect only supplied sampled frames and transcript excerpts, not every moment. Samples are approximate. Never invent unseen actions or claim edits were executed. Return cut proposals only when evidence supports them; preserve uncertain clips. Keep in/out within each supplied trim range and at least 0.3 seconds for kept clips. Include a concise practical process and a reason for every proposed cut.`}];
     for(const item of evidence){content.push({type:'input_text',text:`CLIP ${item.index} (${item.name}), trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)}s; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}`});for(const frame of item.frames){content.push({type:'input_text',text:`Sample from clip ${item.index} at source ${frame.time.toFixed(2)}s`});content.push({type:'input_image',image_url:`data:image/jpeg;base64,${frame.data}`,detail:'low'});}}
-    const ai = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST', headers: {'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json'},
-      body: JSON.stringify({model, input:[{role:'user',content}], text: {format: {type: 'json_schema', name: 'cut_studio_edit_plan', strict: true, schema}}})
-    });
-    const payload = await ai.json();
-    if (!ai.ok) {
-      const message = payload?.error?.message || `OpenAI request failed (${ai.status}).`;
-      res.writeHead(502, {'Content-Type': 'application/json'}).end(JSON.stringify({error: message})); return;
+    let text;
+    if(aiConfig.provider==='openai') {
+      const ai=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${aiConfig.key}`,'Content-Type':'application/json'},body:JSON.stringify({model:aiConfig.model,input:[{role:'user',content}],text:{format:{type:'json_schema',name:'cut_studio_edit_plan',strict:true,schema}}})});
+      const payload=await ai.json();
+      if(!ai.ok){sendJson(res,502,{error:payload?.error?.message||`OpenAI request failed (${ai.status}).`});return;}
+      text=payload.output_text||payload.output?.flatMap(item=>item.content||[]).find(item=>item.type==='output_text')?.text;
+    } else if(aiConfig.provider==='anthropic') {
+      const blocks=[{type:'text',text:content[0].text}];
+      for(const item of evidence){blocks.push({type:'text',text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}.`});for(const frame of item.frames)blocks.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:frame.data}});}
+      const ai=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'x-api-key':aiConfig.key,'anthropic-version':'2023-06-01','content-type':'application/json'},body:JSON.stringify({model:aiConfig.model,max_tokens:4096,system:'You are Cut Studio, a careful video editor. Respond with one valid JSON object matching this schema, and never claim edits were executed: '+JSON.stringify(schema),messages:[{role:'user',content:blocks}]})});
+      const payload=await ai.json();
+      if(!ai.ok){sendJson(res,502,{error:payload?.error?.message||`Anthropic request failed (${ai.status}).`});return;}
+      text=payload.content?.filter(block=>block.type==='text').map(block=>block.text).join('\n');
+    } else if(aiConfig.provider==='gemini') {
+      const parts=[{text:content[0].text}];
+      for(const item of evidence){parts.push({text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}.`});for(const frame of item.frames)parts.push({inlineData:{mimeType:'image/jpeg',data:frame.data}});}
+      const ai=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(aiConfig.model)}:generateContent`,{method:'POST',headers:{'x-goog-api-key':aiConfig.key,'content-type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:'You are Cut Studio, a careful video editor. Never claim edits were executed.'}]},contents:[{role:'user',parts}],generationConfig:{responseMimeType:'application/json',responseSchema:geminiSchema(schema)}})});
+      const payload=await ai.json();
+      if(!ai.ok){sendJson(res,502,{error:payload?.error?.message||`Gemini request failed (${ai.status}).`});return;}
+      text=payload.candidates?.[0]?.content?.parts?.map(part=>part.text||'').join('');
+    } else {
+      const messages=[{role:'system',content:'You are Cut Studio, a careful video editor. Return a concise valid JSON object matching the supplied schema. Never claim edits were executed.'},{role:'user',content:[{type:'text',text:content[0].text},...evidence.flatMap(item=>[{type:'text',text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}.`},...item.frames.flatMap(frame=>[{type:'text',text:`Sample from clip ${item.index} at ${frame.time.toFixed(2)} seconds`},{type:'image_url',image_url:{url:`data:image/jpeg;base64,${frame.data}`}}])])]}];
+      const endpoints={groq:'https://api.groq.com/openai/v1/chat/completions',openrouter:'https://openrouter.ai/api/v1/chat/completions',xai:'https://api.x.ai/v1/chat/completions'};
+      messages[0].content+=` Required JSON schema: ${JSON.stringify(schema)}`;
+      const ai=await fetch(endpoints[aiConfig.provider],{method:'POST',headers:{Authorization:`Bearer ${aiConfig.key}`,'Content-Type':'application/json'},body:JSON.stringify({model:aiConfig.model,messages,temperature:0.2,max_tokens:3000,response_format:{type:'json_object'}})});
+      const payload=await ai.json();
+      if(!ai.ok){sendJson(res,502,{error:payload?.error?.message||`${providerDetails[aiConfig.provider].label} request failed (${ai.status}).`});return;}
+      text=payload.choices?.[0]?.message?.content;
     }
-    const text = payload.output_text || payload.output?.flatMap(item => item.content || []).find(item => item.type === 'output_text')?.text;
     if (!text) throw new Error('AI returned no edit plan.');
     const result=JSON.parse(text);
+    result.engine='byok'; result.provider=aiConfig.provider;
     result.editDecisions=(result.editDecisions||[]).filter(d=>Number.isInteger(d.clipIndex)&&d.clipIndex>=0&&d.clipIndex<clips.length).map(d=>{const clip=clips[d.clipIndex],lo=Math.max(0,clip.trimStart),hi=Math.min(clip.durationSeconds,clip.trimEnd||clip.durationSeconds);let a=Math.max(lo,Math.min(hi,Number(d.inPoint))),b=Math.max(lo,Math.min(hi,Number(d.outPoint)));if(b-a<0.3){a=lo;b=hi;}return {...d,position:Math.max(0,Math.min(clips.length-1,Number(d.position)||0)),inPoint:a,outPoint:b};});
     res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(result));
   } catch (error) {
