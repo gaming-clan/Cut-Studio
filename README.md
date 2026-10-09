@@ -18,7 +18,7 @@ cd backend
 npm install
 ```
 
-Start LM Studio and load a local model, then run the backend. The AI planner uses `lms chat` locally by default, so it does not need a cloud key. In Cut Studio, open the key icon in the top bar to add a provider key. The app recognizes OpenAI, Anthropic, Google Gemini, Groq, OpenRouter, and xAI key formats, then routes AI edit planning to that provider. Keys are held in backend process memory only and cleared when the backend restarts. They are not written to the Flutter app or backend data directory. Automatic speech transcription is available with OpenAI and Groq keys.
+Start LM Studio and load a local model, then run the backend. The AI planner uses `lms chat` locally by default, so it does not need a cloud key. In Cut Studio, open the key icon in the top bar to add a provider key. The app recognizes OpenAI, Anthropic, Google Gemini, Groq, NVIDIA NIM, OpenRouter, and xAI key formats, then routes AI edit planning to that provider. NVIDIA keys use the `nvapi-` format and NVIDIA's hosted chat-completions endpoint. Keys are held in backend process memory only and cleared when the backend restarts. They are not written to the Flutter app or backend data directory. Automatic speech transcription is available with OpenAI and Groq keys.
 
 For LM Studio frame analysis, create a local API token and set `LM_STUDIO_API_TOKEN`; that route sends sampled frames to the local vision model. The text-only CLI fallback never claims to inspect frames or audio.
 

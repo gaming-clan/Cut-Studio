@@ -19,6 +19,7 @@ const providerDetails = {
   anthropic: {label:'Anthropic', model:'claude-haiku-4-5-20251001', captions:false},
   gemini: {label:'Google Gemini', model:'gemini-3.8-flash', captions:false},
   groq: {label:'Groq', model:'qwen/qwen3.6-27b', captions:true},
+  nvidia: {label:'NVIDIA NIM', model:'deepseek-ai/deepseek-v4.1-flash', captions:false},
   openrouter: {label:'OpenRouter', model:'openai/gpt-4.1-mini', captions:false},
   xai: {label:'xAI', model:'grok-4.3', captions:false},
 };
@@ -27,6 +28,7 @@ function detectProvider(key) {
   if (/^sk-ant-/.test(key)) return 'anthropic';
   if (/^sk-or-v1-/.test(key)) return 'openrouter';
   if (/^gsk_/.test(key)) return 'groq';
+  if (/^nvapi-/.test(key)) return 'nvidia';
   if (/^AIza[\w-]{20,}$/.test(key)) return 'gemini';
   if (/^xai-/.test(key)) return 'xai';
   if (/^sk-(?:proj-|svcacct-|admin-|)/.test(key)) return 'openai';
@@ -389,7 +391,7 @@ const server = createServer(async (req, res) => {
       text=payload.candidates?.[0]?.content?.parts?.map(part=>part.text||'').join('');
     } else {
       const messages=[{role:'system',content:'You are Cut Studio, a careful video editor. Return a concise valid JSON object matching the supplied schema. Never claim edits were executed.'},{role:'user',content:[{type:'text',text:content[0].text},...evidence.flatMap(item=>[{type:'text',text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}.`},...item.frames.flatMap(frame=>[{type:'text',text:`Sample from clip ${item.index} at ${frame.time.toFixed(2)} seconds`},{type:'image_url',image_url:{url:`data:image/jpeg;base64,${frame.data}`}}])])]}];
-      const endpoints={groq:'https://api.groq.com/openai/v1/chat/completions',openrouter:'https://openrouter.ai/api/v1/chat/completions',xai:'https://api.x.ai/v1/chat/completions'};
+      const endpoints={groq:'https://api.groq.com/openai/v1/chat/completions',openrouter:'https://openrouter.ai/api/v1/chat/completions',xai:'https://api.x.ai/v1/chat/completions',nvidia:'https://integrate.api.nvidia.com/v1/chat/completions'};
       messages[0].content+=` Required JSON schema: ${JSON.stringify(schema)}`;
       const ai=await fetch(endpoints[aiConfig.provider],{method:'POST',headers:{Authorization:`Bearer ${aiConfig.key}`,'Content-Type':'application/json'},body:JSON.stringify({model:aiConfig.model,messages,temperature:0.2,max_tokens:3000,response_format:{type:'json_object'}})});
       const payload=await ai.json();

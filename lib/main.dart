@@ -434,6 +434,7 @@ class _EditorScreenState extends State<EditorScreen> {
     if (key.startsWith('sk-ant-')) return 'Anthropic';
     if (key.startsWith('sk-or-v1-')) return 'OpenRouter';
     if (key.startsWith('gsk_')) return 'Groq';
+    if (key.startsWith('nvapi-')) return 'NVIDIA NIM';
     if (RegExp(r'^AIza[\w-]{20,}$').hasMatch(key)) return 'Google Gemini';
     if (key.startsWith('xai-')) return 'xAI';
     if (key.startsWith('sk-')) return 'OpenAI';
@@ -463,7 +464,7 @@ class _EditorScreenState extends State<EditorScreen> {
         const SizedBox(height: 14),
         TextField(controller: _apiKeyController, obscureText: true, autocorrect: false, enableSuggestions: false, decoration: const InputDecoration(labelText: 'Provider API key', hintText: 'Paste an API key', border: OutlineInputBorder()), onChanged: (value) => refresh(() => detected = _detectProvider(value.trim()))),
         const SizedBox(height: 8),
-        Text(detected == null ? 'Supported: OpenAI, Anthropic, Gemini, Groq, OpenRouter, xAI' : 'Detected provider: $detected', style: TextStyle(fontSize: 12, color: detected == null ? Colors.white54 : const Color(0xFFB8F36B))),
+        Text(detected == null ? 'Supported: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, xAI' : 'Detected provider: $detected', style: TextStyle(fontSize: 12, color: detected == null ? Colors.white54 : const Color(0xFFB8F36B))),
         const SizedBox(height: 10),
         const Text('The key is sent only to your configured Cut Studio backend and held in its memory. It is not saved to disk and is cleared when the backend restarts. Without a provider key (or OPENAI_API_KEY environment key), AI planning uses your local LM Studio model.', style: TextStyle(fontSize: 12, color: Colors.white60)),
         if (error != null) ...[const SizedBox(height: 10), Text(error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12))],
