@@ -40,9 +40,17 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _aiBusy = false;
   bool _mediaBusy = false;
   bool _renderBusy = false;
+  bool _applyingAiEdits = false;
+  bool _modelsBusy = false;
   bool _removeSilences = false;
   String _providerLabel = 'Checking…';
+  String _aiMode = 'auto';
+  String _selectedModelId = 'auto';
+  String? _editorAction;
+  List<Map<String, dynamic>> _aiModels = [];
   final TextEditingController _apiKeyController = TextEditingController();
+  final TextEditingController _modelNameController = TextEditingController();
+  final TextEditingController _modelIdController = TextEditingController();
   VideoPlayerController? _previewController;
   final List<String> _assetIds = [];
   final List<double> _durations = [];
@@ -65,13 +73,15 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   void initState() {
     super.initState();
-    _loadProviderStatus();
+    _refreshAiModels();
   }
 
   @override
   void dispose() {
     _promptController.dispose();
     _apiKeyController.dispose();
+    _modelNameController.dispose();
+    _modelIdController.dispose();
     _previewController?.dispose();
     super.dispose();
   }
@@ -108,7 +118,7 @@ class _EditorScreenState extends State<EditorScreen> {
           border: Border(bottom: BorderSide(color: Color(0xFF25262A))),
         ),
         child: Row(children: [
-          const Icon(Icons.movie_creation_outlined, color: Color(0xFFB8F36B)),
+          Image.asset('assets/cut_studio_icon.png', width: 30, height: 30),
           const SizedBox(width: 10),
           const Text('CUTSTUDIO', style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.5)),
           const SizedBox(width: 24),
@@ -119,7 +129,7 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(width: 8),
           const Text('Saved', style: TextStyle(color: Colors.white54, fontSize: 12)),
           const SizedBox(width: 20),
-          IconButton(tooltip: 'AI provider and API key', onPressed: _showProviderSettings, icon: const Icon(Icons.key_outlined)),
+          IconButton(tooltip: 'AI models and API keys', onPressed: _showAiModelsSettings, icon: const Icon(Icons.key_outlined)),
           OutlinedButton.icon(onPressed: _showExport, icon: const Icon(Icons.ios_share, size: 16), label: const Text('Export')),
           const SizedBox(width: 10),
           FilledButton.icon(
@@ -255,14 +265,58 @@ class _EditorScreenState extends State<EditorScreen> {
         ),
       ]);
 
+  List<Map<String, dynamic>> get _selectableModels => _aiModels.where((item) => item['kind'] == (_aiMode == 'local' ? 'local' : 'byok')).toList();
+
+  Widget _aiModelControls() {
+    final choices = _selectableModels;
+    final hasModeModels = choices.isNotEmpty;
+    final selectedExists = choices.any((item) => item['id'] == _selectedModelId);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: DropdownButtonHideUnderline(child: DropdownButton<String>(
+          value: _aiMode,
+          isExpanded: true,
+          style: const TextStyle(fontSize: 12, color: Colors.white),
+          items: const [
+            DropdownMenuItem(value: 'auto', child: Text('Auto · best for task')),
+            DropdownMenuItem(value: 'local', child: Text('Local models')),
+            DropdownMenuItem(value: 'byok', child: Text('BYOK models')),
+          ],
+          onChanged: _modelsBusy ? null : (value) { if (value != null) _setAiMode(value); },
+        ))),
+        IconButton(tooltip: 'Manage models and keys', onPressed: _showAiModelsSettings, icon: const Icon(Icons.tune, size: 18)),
+      ]),
+      if (_aiMode != 'auto' && hasModeModels)
+        DropdownButtonHideUnderline(child: DropdownButton<String>(
+          value: selectedExists ? _selectedModelId : choices.first['id'] as String,
+          isExpanded: true,
+          hint: const Text('Choose a model'),
+          style: const TextStyle(fontSize: 11, color: Colors.white70),
+          items: choices.map((item) => DropdownMenuItem<String>(value: item['id'] as String, child: Text('${item['name']}${item['vision'] == true ? ' · vision' : ''}', overflow: TextOverflow.ellipsis))).toList(),
+          onChanged: _modelsBusy ? null : (value) { if (value != null) _setAiSelection(_aiMode, value); },
+        )),
+      if (_aiMode != 'auto' && !hasModeModels)
+        TextButton.icon(onPressed: _showAiModelsSettings, icon: const Icon(Icons.add, size: 14), label: Text(_aiMode == 'local' ? 'Refresh local models' : 'Add a BYOK model')),
+      if (_aiMode == 'auto') ...[
+        const Text('Matches the brief to local vision, transcription, or the best available provider model.', style: TextStyle(fontSize: 10, color: Colors.white54)),
+      ],
+    ]);
+  }
+
   Widget _inspector() => SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Padding(padding: EdgeInsets.fromLTRB(18, 20, 18, 14), child: Text('AI ASSISTANT', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Color(0xFFB8F36B), fontWeight: FontWeight.bold))),
         Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: const Color(0xFF1D211A), border: Border.all(color: const Color(0xFF39442F)), borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _aiModelControls(),
+          const SizedBox(height: 12),
           const Text('What should we make?', style: TextStyle(fontWeight: FontWeight.w600)),
           const SizedBox(height: 10),
           TextField(controller: _promptController, maxLines: 3, decoration: InputDecoration(hintText: '“Make this feel like a travel film…”', hintStyle: const TextStyle(fontSize: 12, color: Colors.white38), filled: true, fillColor: const Color(0xFF111310), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none), contentPadding: const EdgeInsets.all(11))),
           const SizedBox(height: 10),
-          SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _aiBusy ? null : _generateEdit, icon: Icon(_aiBusy ? Icons.hourglass_top : Icons.auto_awesome, size: 15), label: Text(_aiBusy ? 'Planning…' : 'Generate edit'))),
+          if (_aiBusy || _applyingAiEdits) ...[
+            Row(children: [const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)), const SizedBox(width: 8), Expanded(child: Text(_editorAction ?? 'Reviewing your brief and footage…', style: const TextStyle(fontSize: 11, color: Colors.white70)))]),
+            const SizedBox(height: 10),
+          ],
+          SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _aiBusy || _applyingAiEdits ? null : _generateEdit, icon: Icon(_aiBusy || _applyingAiEdits ? Icons.hourglass_top : Icons.auto_awesome, size: 15), label: Text(_aiBusy ? 'Editing…' : _applyingAiEdits ? 'Applying edit…' : 'Generate edit'))),
         ]))),
         const Padding(padding: EdgeInsets.fromLTRB(18, 24, 18, 8), child: Text('QUICK ACTIONS', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
         _action(Icons.content_cut, 'Remove silences', 'Tighten the pacing', onTap: () { setState(() => _removeSilences = !_removeSilences); _toast(_removeSilences ? 'Silence removal will be applied on export' : 'Silence removal turned off'); _runQuickAction('Remove silences', 'Analyze the selected video and remove long pauses while preserving a short natural breath.'); }),
@@ -441,67 +495,125 @@ class _EditorScreenState extends State<EditorScreen> {
     return null;
   }
 
-  Future<void> _loadProviderStatus() async {
+  Future<void> _refreshAiModels() async {
     try {
-      final response = await http.get(_backendUri('/api/settings/provider-key')).timeout(const Duration(seconds: 5));
+      final response = await http.get(_backendUri('/api/ai/models')).timeout(const Duration(seconds: 20));
       if (response.statusCode != 200) return;
       final status = jsonDecode(response.body) as Map<String, dynamic>;
-      if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
+      if (!mounted) return;
+      setState(() {
+        _aiMode = status['mode'] as String? ?? 'auto';
+        _selectedModelId = status['modelId'] as String? ?? 'auto';
+        _aiModels = (status['models'] as List? ?? const []).whereType<Map>().map((item) => Map<String, dynamic>.from(item)).toList();
+        final selected = _aiModels.where((item) => item['id'] == _selectedModelId).firstOrNull;
+        _providerLabel = selected?['name'] as String? ?? (_aiMode == 'auto' ? 'Auto' : 'Local LM Studio');
+      });
     } catch (_) {
       if (mounted) setState(() => _providerLabel = 'Backend offline');
     }
   }
 
-  Future<void> _showProviderSettings() async {
+  Future<void> _setAiSelection(String mode, String modelId) async {
+    setState(() => _modelsBusy = true);
+    try {
+      final response = await http.post(_backendUri('/api/ai/selection'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'mode': mode, 'modelId': modelId})).timeout(const Duration(seconds: 10));
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(body['error'] ?? 'Could not switch AI models.');
+      if (mounted) { setState(() {
+        _aiMode = body['mode'] as String? ?? mode;
+        _selectedModelId = body['modelId'] as String? ?? modelId;
+        _aiModels = (body['models'] as List? ?? const []).whereType<Map>().map((item) => Map<String, dynamic>.from(item)).toList();
+        _providerLabel = _aiModels.where((item) => item['id'] == _selectedModelId).firstOrNull?['name'] as String? ?? 'Auto';
+      }); }
+    } catch (error) {
+      if (mounted) _toast(error.toString().replaceFirst('Exception: ', ''));
+      await _refreshAiModels();
+    } finally {
+      if (mounted) setState(() => _modelsBusy = false);
+    }
+  }
+
+  Future<void> _setAiMode(String mode) async {
+    if (mode == 'auto') { await _setAiSelection('auto', 'auto'); return; }
+    final options = _aiModels.where((item) => item['kind'] == (mode == 'local' ? 'local' : 'byok')).toList();
+    if (options.isEmpty) {
+      if (mode == 'byok') { await _showAiModelsSettings(); return; }
+      await _refreshAiModels();
+      final refreshed = _aiModels.where((item) => item['kind'] == 'local').toList();
+      if (refreshed.isEmpty) { _toast('No local LM Studio models were found.'); return; }
+      await _setAiSelection(mode, refreshed.first['id'] as String);
+      return;
+    }
+    await _setAiSelection(mode, options.first['id'] as String);
+  }
+
+  Future<void> _showAiModelsSettings() async {
     _apiKeyController.clear();
+    _modelNameController.clear();
+    _modelIdController.clear();
     var detected = _detectProvider(_apiKeyController.text);
     var busy = false;
     String? error;
     await showDialog<void>(context: context, builder: (dialogContext) => StatefulBuilder(builder: (context, refresh) => AlertDialog(
-      title: const Text('AI provider and API key'),
-      content: SizedBox(width: 440, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('Current: $_providerLabel', style: const TextStyle(color: Color(0xFFB8F36B), fontWeight: FontWeight.w600)),
-        const SizedBox(height: 14),
-        TextField(controller: _apiKeyController, obscureText: true, autocorrect: false, enableSuggestions: false, decoration: const InputDecoration(labelText: 'Provider API key', hintText: 'Paste an API key', border: OutlineInputBorder()), onChanged: (value) => refresh(() => detected = _detectProvider(value.trim()))),
+      title: const Text('AI models and provider keys'),
+      content: SizedBox(width: 520, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Mode: ${_aiMode.toUpperCase()} · Active: $_providerLabel', style: const TextStyle(color: Color(0xFFB8F36B), fontWeight: FontWeight.w600)),
         const SizedBox(height: 8),
-        Text(detected == null ? 'Supported: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, xAI' : 'Detected provider: $detected', style: TextStyle(fontSize: 12, color: detected == null ? Colors.white54 : const Color(0xFFB8F36B))),
-        const SizedBox(height: 10),
-        const Text('The key is sent only to your configured Cut Studio backend and held in its memory. It is not saved to disk and is cleared when the backend restarts. Without a provider key (or OPENAI_API_KEY environment key), AI planning uses your local LM Studio model.', style: TextStyle(fontSize: 12, color: Colors.white60)),
-        if (error != null) ...[const SizedBox(height: 10), Text(error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12))],
-      ])),
+        const Text('Add several provider keys and model IDs. They stay in backend memory and are cleared when it restarts.', style: TextStyle(fontSize: 12, color: Colors.white60)),
+        const SizedBox(height: 12),
+        TextField(controller: _modelNameController, decoration: const InputDecoration(labelText: 'Display name (optional)', hintText: 'e.g. Fast local-style edits', border: OutlineInputBorder())),
+        const SizedBox(height: 8),
+        TextField(controller: _modelIdController, decoration: const InputDecoration(labelText: 'Model ID (optional)', hintText: 'Leave blank for provider default', border: OutlineInputBorder())),
+        const SizedBox(height: 8),
+        TextField(controller: _apiKeyController, obscureText: true, autocorrect: false, enableSuggestions: false, decoration: const InputDecoration(labelText: 'Provider API key', hintText: 'Paste an API key', border: OutlineInputBorder()), onChanged: (value) => refresh(() => detected = _detectProvider(value.trim()))),
+        const SizedBox(height: 6),
+        Text(detected == null ? 'Supported: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, xAI' : 'Detected provider: $detected', style: TextStyle(fontSize: 11, color: detected == null ? Colors.white54 : const Color(0xFFB8F36B))),
+        if (error != null) ...[const SizedBox(height: 8), Text(error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12))],
+        const Divider(height: 24),
+        const Text('SAVED BYOK MODELS', style: TextStyle(fontSize: 10, letterSpacing: 1.2, color: Colors.white54, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        ..._aiModels.where((item) => item['kind'] == 'byok' && item['id'] != 'env-openai').map((item) => ListTile(
+          dense: true, contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.cloud_outlined, size: 18, color: Color(0xFFB8F36B)),
+          title: Text(item['name'] as String? ?? item['model'] as String? ?? 'BYOK model', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+          subtitle: Text('${item['provider'] ?? ''} · ${item['model'] ?? ''}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 10)),
+          trailing: IconButton(tooltip: 'Remove model', icon: const Icon(Icons.delete_outline, size: 17), onPressed: busy ? null : () async {
+            refresh(() { busy = true; error = null; });
+            try {
+              final response = await http.delete(_backendUri('/api/ai/models/${item['id']}')).timeout(const Duration(seconds: 10));
+              final body = jsonDecode(response.body) as Map<String, dynamic>;
+              if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(body['error'] ?? 'Could not remove model.');
+              if (mounted) setState(() { _aiMode = body['mode'] as String? ?? 'auto'; _selectedModelId = body['modelId'] as String? ?? 'auto'; _aiModels = (body['models'] as List? ?? const []).whereType<Map>().map((entry) => Map<String, dynamic>.from(entry)).toList(); });
+              refresh(() => busy = false);
+            } catch (e) { refresh(() { error = e.toString().replaceFirst('Exception: ', ''); busy = false; }); }
+          }),
+        )),
+        if (!_aiModels.any((item) => item['kind'] == 'byok' && item['id'] != 'env-openai')) const Padding(padding: EdgeInsets.symmetric(vertical: 8), child: Text('No app-added BYOK models yet.', style: TextStyle(fontSize: 11, color: Colors.white38))),
+      ]))),
       actions: [
-        TextButton(onPressed: busy ? null : () async {
-          refresh(() { busy = true; error = null; });
-          try {
-            final response = await http.delete(_backendUri('/api/settings/provider-key')).timeout(const Duration(seconds: 10));
-            if (response.statusCode < 200 || response.statusCode >= 300) throw Exception('Could not clear the provider key.');
-            final status = jsonDecode(response.body) as Map<String, dynamic>;
-            if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
-            if (dialogContext.mounted) Navigator.pop(dialogContext);
-          } catch (e) { refresh(() { error = e.toString().replaceFirst('Exception: ', ''); busy = false; }); }
-        }, child: const Text('Clear saved key')),
         TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
         FilledButton(onPressed: busy || detected == null || _apiKeyController.text.trim().isEmpty ? null : () async {
           refresh(() { busy = true; error = null; });
           try {
-            final response = await http.post(_backendUri('/api/settings/provider-key'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'apiKey': _apiKeyController.text.trim()})).timeout(const Duration(seconds: 10));
+            final response = await http.post(_backendUri('/api/ai/models'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'apiKey': _apiKeyController.text.trim(),'name':_modelNameController.text.trim(),'model':_modelIdController.text.trim()})).timeout(const Duration(seconds: 10));
             final body = jsonDecode(response.body);
-            if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(body is Map ? body['error'] ?? 'Could not save the key.' : 'Could not save the key.');
+            if (response.statusCode < 200 || response.statusCode >= 300) throw Exception(body is Map ? body['error'] ?? 'Could not add the model.' : 'Could not add the model.');
             final status = body as Map<String, dynamic>;
             _apiKeyController.clear();
-            if (mounted) setState(() => _providerLabel = status['label'] as String? ?? 'Local LM Studio');
-            if (dialogContext.mounted) Navigator.pop(dialogContext);
-            if (mounted) _toast('Using $_providerLabel for AI requests.');
+            _modelNameController.clear(); _modelIdController.clear();
+            if (mounted) setState(() { _aiMode = status['mode'] as String? ?? 'byok'; _selectedModelId = status['modelId'] as String? ?? 'auto'; _aiModels = (status['models'] as List? ?? const []).whereType<Map>().map((item) => Map<String, dynamic>.from(item)).toList(); _providerLabel = status['model']?['name'] as String? ?? 'BYOK model'; });
+            detected = null;
+            refresh(() { busy = false; });
           } catch (e) { refresh(() { error = e.toString().replaceFirst('Exception: ', ''); busy = false; }); }
-        }, child: Text(busy ? 'Saving…' : 'Save key')),
+        }, child: Text(busy ? 'Adding…' : 'Add model')),
       ],
     )));
-    _apiKeyController.clear();
+    _apiKeyController.clear(); _modelNameController.clear(); _modelIdController.clear();
   }
 
   Future<void> _generateEdit() async {
-    if (_aiBusy) return;
-    setState(() => _aiBusy = true);
+    if (_aiBusy || _applyingAiEdits) return;
+    setState(() { _aiBusy = true; _editorAction = 'Reading your brief and reviewing the timeline…'; });
     final prompt = _promptController.text.trim().isEmpty
         ? 'Create a polished story from these clips.'
         : _promptController.text.trim();
@@ -517,18 +629,23 @@ class _EditorScreenState extends State<EditorScreen> {
       final response = await http.post(
         Uri.parse(_aiEndpoint),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'prompt': prompt, 'clips': clips, 'captionsEnabled': _captions}),
-      ).timeout(const Duration(seconds: 60));
+        body: jsonEncode({'prompt': prompt, 'clips': clips, 'captionsEnabled': _captions, 'aiMode': _aiMode, 'modelId': _selectedModelId}),
+      ).timeout(const Duration(minutes: 5));
       if (response.statusCode < 200 || response.statusCode >= 300) {
         final body = jsonDecode(response.body);
         throw Exception(body is Map ? (body['error'] ?? 'AI request failed') : 'AI request failed');
       }
       final plan = jsonDecode(response.body) as Map<String, dynamic>;
       if (!mounted) return;
+      setState(() => _editorAction = null);
       showDialog<void>(context: context, builder: (dialogContext) => AlertDialog(
-        title: Row(children: [const Icon(Icons.auto_awesome, color: Color(0xFFB8F36B)), const SizedBox(width: 10), Expanded(child: Text(plan['title'] as String? ?? 'Your edit plan'))]),
+        title: Row(children: [Image.asset('assets/cut_studio_icon.png', width: 26, height: 26), const SizedBox(width: 10), Expanded(child: Text(plan['title'] as String? ?? 'Your edit plan'))]),
         content: SizedBox(width: 460, child: SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
           Text(plan['summary'] as String? ?? ''),
+          if ((plan['routerReason'] as String?)?.isNotEmpty == true) ...[
+            const SizedBox(height: 8),
+            Text('Model choice: ${plan['routerReason']}', style: const TextStyle(color: Colors.white54, fontSize: 11)),
+          ],
           const SizedBox(height: 16),
           for (final step in (plan['steps'] as List? ?? const []))
             Padding(padding: const EdgeInsets.only(bottom: 12), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -547,7 +664,7 @@ class _EditorScreenState extends State<EditorScreen> {
               ? 'Generated locally with ${plan['model'] ?? 'LM Studio'}. This model received clip names and technical metadata, not video images or audio; preview every suggested edit.'
               : 'Generated with ${plan['provider'] ?? _providerLabel}. AI suggestions are based on sampled frames and, when supported and needed, a transcript. Review before applying.', style: const TextStyle(color: Colors.white38, fontSize: 11)),
         ]))),
-        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Keep timeline')), if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) FilledButton(onPressed: () { _applyAiEdits(plan); Navigator.pop(dialogContext); }, child: const Text('Apply suggested cuts'))],
+        actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Keep timeline')), if ((plan['editDecisions'] as List? ?? const []).isNotEmpty) FilledButton(onPressed: _applyingAiEdits ? null : () { _applyAiEdits(plan); Navigator.pop(dialogContext); }, child: const Text('Apply editor’s cuts'))],
       ));
     } catch (error) {
       if (!mounted) return;
@@ -558,21 +675,30 @@ class _EditorScreenState extends State<EditorScreen> {
         actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('OK'))],
       ));
     } finally {
-      if (mounted) setState(() => _aiBusy = false);
+      if (mounted) setState(() { _aiBusy = false; if (!_applyingAiEdits) _editorAction = null; });
     }
   }
 
-  void _applyAiEdits(Map<String, dynamic> plan) {
+  Future<void> _applyAiEdits(Map<String, dynamic> plan) async {
     final decisions = (plan['editDecisions'] as List? ?? const []).cast<Map<String, dynamic>>();
-    if (decisions.isEmpty || _timelineMedia.isEmpty) return;
+    if (decisions.isEmpty || _timelineMedia.isEmpty || _applyingAiEdits) return;
+    setState(() { _applyingAiEdits = true; _editorAction = 'Walking the timeline and refining each shot…'; });
     final byClip = <int, Map<String, dynamic>>{for (final decision in decisions) decision['clipIndex'] as int: decision};
     final ordered = List<int>.generate(_timelineMedia.length, (i) => i);
     ordered.sort((a, b) => ((byClip[a]?['position'] as int?) ?? a).compareTo((byClip[b]?['position'] as int?) ?? b));
     final updated = <int>[];
     for (final clipIndex in ordered) {
       final decision = byClip[clipIndex];
-      if (decision?['keep'] == false) continue;
       final mediaIndex = _timelineMedia[clipIndex];
+      setState(() {
+        _selectedClip = clipIndex;
+        _editorAction = decision?['keep'] == false
+            ? 'Removing the weak passage from ${_media[mediaIndex].name}…'
+            : 'Reviewing ${_media[mediaIndex].name} and setting its in/out points…';
+      });
+      await _loadPreview(clipIndex);
+      await Future<void>.delayed(const Duration(milliseconds: 260));
+      if (decision?['keep'] == false) continue;
       if (decision != null) {
         final low = _trimRanges[mediaIndex].start, high = _trimRanges[mediaIndex].end;
         final start = ((decision['inPoint'] as num).toDouble()).clamp(low, high).toDouble();
@@ -581,10 +707,14 @@ class _EditorScreenState extends State<EditorScreen> {
       }
       updated.add(mediaIndex);
     }
-    if (updated.isEmpty) { _toast('AI did not recommend any safe cuts; timeline kept.'); return; }
-    setState(() { _timelineMedia..clear()..addAll(updated); _selectedClip = 0; _captionSegments.clear(); });
-    _loadPreview(0);
-    _toast('Applied reviewed AI cuts. Captions cleared because timing changed.');
+    if (updated.isEmpty) {
+      _toast('AI did not recommend any safe cuts; timeline kept.');
+    } else {
+      setState(() { _editorAction = 'Arranging the rough cut and refreshing captions…'; _timelineMedia..clear()..addAll(updated); _selectedClip = 0; _captionSegments.clear(); });
+      await _loadPreview(0);
+      _toast('Applied the reviewed cuts and rearranged the timeline.');
+    }
+    if (mounted) setState(() { _applyingAiEdits = false; _editorAction = null; });
   }
 
   void _showExport() {

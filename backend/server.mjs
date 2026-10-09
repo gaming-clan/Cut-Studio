@@ -23,7 +23,9 @@ const providerDetails = {
   openrouter: {label:'OpenRouter', model:'openai/gpt-4.1-mini', captions:false},
   xai: {label:'xAI', model:'grok-4.3', captions:false},
 };
-let byokConfig = null;
+const byokModels = [];
+let aiSelection = {mode:'auto',modelId:'auto'};
+let localModelsCache = {at:0,models:[]};
 function detectProvider(key) {
   if (/^sk-ant-/.test(key)) return 'anthropic';
   if (/^sk-or-v1-/.test(key)) return 'openrouter';
@@ -34,14 +36,55 @@ function detectProvider(key) {
   if (/^sk-(?:proj-|svcacct-|admin-|)/.test(key)) return 'openai';
   return null;
 }
-function activeProvider() {
-  if (byokConfig) return byokConfig;
-  if (process.env.OPENAI_API_KEY) return {provider:'openai',key:process.env.OPENAI_API_KEY,model};
-  return null;
+function environmentModel() {
+  return process.env.OPENAI_API_KEY ? {id:'env-openai',kind:'byok',provider:'openai',key:process.env.OPENAI_API_KEY,model,label:'OpenAI (environment key)',name:'OpenAI (environment key)',supportsCaptions:true,vision:true} : null;
+}
+function publicModel(item) {
+  const {key,...safe}=item;
+  return safe;
+}
+function publicByokModels() {
+  return [...byokModels,...(environmentModel()?[environmentModel()]:[])].map(publicModel);
+}
+async function discoverLocalModels() {
+  if(Date.now()-localModelsCache.at<20_000) return localModelsCache.models;
+  try {
+    const {stdout}=await execFileAsync(localCli,['ls','--llm','--json'],{timeout:15_000,maxBuffer:4*1024*1024,windowsHide:true});
+    const start=stdout.indexOf('[');
+    if(start<0) throw new Error('LM Studio model list was not JSON.');
+    const entries=JSON.parse(stdout.slice(start)).filter(item=>item.type==='llm'&&item.modelKey);
+    localModelsCache={at:Date.now(),models:entries.map(item=>({id:`local:${encodeURIComponent(item.modelKey)}`,kind:'local',provider:'lmstudio',model:item.modelKey,name:item.displayName||item.modelKey,label:item.displayName||item.modelKey,vision:Boolean(item.vision),supportsCaptions:false,paramsString:item.paramsString||'',maxContextLength:item.maxContextLength||0}))};
+  } catch {
+    localModelsCache={at:Date.now(),models:[{id:`local:${encodeURIComponent(localModel)}`,kind:'local',provider:'lmstudio',model:localModel,name:localModel,label:localModel,vision:false,supportsCaptions:false,paramsString:'',maxContextLength:0}]};
+  }
+  return localModelsCache.models;
+}
+async function modelCatalog() {
+  const local=await discoverLocalModels();
+  return [{id:'auto',kind:'auto',provider:null,model:null,name:'Auto · choose per task',label:'Auto · choose per task',vision:true,supportsCaptions:true},...local,...publicByokModels()];
+}
+function activeProvider(modelId=null) {
+  if(aiSelection.mode==='local') return null;
+  const selectedId=modelId||aiSelection.modelId;
+  if(selectedId&&selectedId!=='auto') {
+    const selected=byokModels.find(item=>item.id===selectedId);
+    if(selected) return selected;
+    if(selectedId==='env-openai') return environmentModel();
+  }
+  if(aiSelection.mode==='byok') return byokModels[0]||environmentModel();
+  return environmentModel();
+}
+function transcriptionProvider() {
+  if(aiSelection.mode==='local') return null;
+  if(aiSelection.mode==='byok') {
+    const selected=activeProvider();
+    return selected&&providerDetails[selected.provider]?.captions?selected:null;
+  }
+  return [...byokModels,...(environmentModel()?[environmentModel()]:[])].find(item=>providerDetails[item.provider]?.captions)||null;
 }
 function providerStatus() {
   const config=activeProvider();
-  return config ? {configured:true,provider:config.provider,label:providerDetails[config.provider].label,supportsCaptions:providerDetails[config.provider].captions} : {configured:false,provider:null,label:'Local LM Studio',supportsCaptions:false};
+  return config ? {configured:true,provider:config.provider,label:config.label||providerDetails[config.provider].label,supportsCaptions:providerDetails[config.provider].captions} : {configured:false,provider:null,label:'Local LM Studio',supportsCaptions:false};
 }
 function geminiSchema(source) {
   const types={object:'OBJECT',array:'ARRAY',string:'STRING',number:'NUMBER',integer:'INTEGER',boolean:'BOOLEAN'};
@@ -52,6 +95,49 @@ function geminiSchema(source) {
   if(source.enum) target.enum=source.enum;
   if(source.description) target.description=source.description;
   return target;
+}
+function localSizeScore(item) {
+  const size=parseFloat(String(item.paramsString||'').replace(/[^0-9.]/g,''));
+  return Number.isFinite(size)?size:0;
+}
+function providerQualityScore(item) {
+  const rank={openai:8,anthropic:7,gemini:7,nvidia:7,xai:6,groq:5,openrouter:5};
+  return rank[item.provider]||0;
+}
+async function resolveAiModel(input,prompt) {
+  const mode=['auto','local','byok'].includes(input.aiMode)?input.aiMode:aiSelection.mode;
+  const selectedId=String(input.modelId||aiSelection.modelId||'auto');
+  const models=await modelCatalog();
+  const local=models.filter(item=>item.kind==='local');
+  const remote=models.filter(item=>item.kind==='byok');
+  if(mode==='local') {
+    const selected=local.find(item=>item.id===selectedId)||local.find(item=>item.model===localModel)||local[0];
+    if(!selected) throw new Error('No local language models were found. Start LM Studio and refresh the model list.');
+    return {...selected,key:null,reason:`Local mode selected ${selected.name}.`};
+  }
+  if(mode==='byok') {
+    const selected=remote.find(item=>item.id===selectedId)||remote[0];
+    if(!selected) throw new Error('BYOK mode has no configured models. Add a provider key and model in AI Model Settings.');
+    const secret=byokModels.find(item=>item.id===selected.id)||environmentModel();
+    return {...selected,...secret,reason:`BYOK mode selected ${selected.name}.`};
+  }
+  const needsTranscript=/dialogue|speech|spoken|quote|exact words|transcript|transcribe|what .* say|captions/i.test(prompt);
+  const transcriptModel=remote.filter(item=>item.supportsCaptions).sort((a,b)=>providerQualityScore(b)-providerQualityScore(a))[0];
+  if(needsTranscript&&transcriptModel) {
+    const secret=byokModels.find(item=>item.id===transcriptModel.id)||environmentModel();
+    return {...transcriptModel,...secret,reason:`The request depends on spoken words, so Auto selected ${transcriptModel.name}, which can also transcribe audio.`};
+  }
+  const localToken=process.env.LM_STUDIO_API_TOKEN||process.env.LM_API_TOKEN;
+  const localVision=localToken?local.filter(item=>item.vision).sort((a,b)=>localSizeScore(b)-localSizeScore(a))[0]:null;
+  if(localVision) return {...localVision,key:null,reason:`Auto selected the largest available local vision model, ${localVision.name}, to inspect the footage without sending it to a cloud provider.`};
+  const remoteVision=remote.filter(item=>item.vision).sort((a,b)=>providerQualityScore(b)-providerQualityScore(a))[0];
+  if(remoteVision) {
+    const secret=byokModels.find(item=>item.id===remoteVision.id)||environmentModel();
+    return {...remoteVision,...secret,reason:`Auto selected ${remoteVision.name}, the strongest configured vision-capable BYOK model, for shot analysis.`};
+  }
+  const localText=local.sort((a,b)=>localSizeScore(b)-localSizeScore(a))[0];
+  if(localText) return {...localText,key:null,reason:`No vision-capable model is ready, so Auto chose ${localText.name} for a text-only editing recommendation.`};
+  throw new Error('No local or BYOK AI models are available. Configure LM Studio or add a provider key.');
 }
 const dataRoot = path.resolve(process.env.CUT_STUDIO_DATA || 'data');
 const uploadRoot = path.join(dataRoot, 'uploads');
@@ -92,12 +178,12 @@ async function ffmpeg(args, options = {}) {
   try { return await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner','-y',...args], { maxBuffer: 12 * 1024 * 1024, ...options }); }
   catch (error) { throw new Error((error.stderr || error.message || 'FFmpeg failed').slice(-3000)); }
 }
-function runLocalChat(prompt) {
+function runLocalChat(prompt, modelName=localModel, systemPrompt='Return a concise, evidence-based response.') {
   return new Promise((resolve, reject) => {
-    const child = spawn(localCli, ['chat', localModel, '--reasoning', 'off', '-p', prompt, '-s', 'Give one short sentence only. Do not reason aloud.', '--ttl', '3600'], { windowsHide: true });
+    const child = spawn(localCli, ['chat', modelName, '--reasoning', 'off', '-p', prompt, '-s', systemPrompt, '--ttl', '3600'], { windowsHide: true });
     let stdout = '', stderr = '', settled = false;
     const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(value); };
-    const timer = setTimeout(() => { child.kill(); finish(new Error(`Local model ${localModel} timed out.`)); }, 3 * 60 * 1000);
+    const timer = setTimeout(() => { child.kill(); finish(new Error(`Local model ${modelName} timed out.`)); }, 3 * 60 * 1000);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 512 * 1024) { child.kill(); finish(new Error('Local model output exceeded 512 KB.')); } });
     child.stderr.on('data', chunk => { stderr += chunk; if (stderr.length > 512 * 1024) stderr = stderr.slice(-512 * 1024); });
@@ -110,8 +196,7 @@ function assetPath(id) { if (!/^[a-f0-9-]{36}$/.test(String(id))) throw new Erro
 function sendJson(res, status, value) { res.writeHead(status, {'Content-Type':'application/json'}).end(JSON.stringify(value)); }
 async function readJson(req, limit=200_000) { let raw=''; for await (const chunk of req) { raw += chunk; if (raw.length > limit) throw new Error('Request is too large.'); } return JSON.parse(raw); }
 
-async function transcribeMedia(source) {
-  const config=activeProvider();
+async function transcribeMedia(source, config=transcriptionProvider()) {
   if(!config||!providerDetails[config.provider].captions) throw new Error('Automatic captions are available with OpenAI or Groq keys.');
   const audioDir = await mkdtemp(path.join(tmpdir(), 'cutstudio-caption-'));
   try {
@@ -191,19 +276,56 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, ...providerStatus(), localModel})); return;
   }
+  if (req.url === '/api/ai/models' && req.method === 'GET') {
+    sendJson(res,200,{...aiSelection,models:await modelCatalog()}); return;
+  }
+  if (req.url === '/api/ai/models' && req.method === 'POST') {
+    try {
+      const input=await readJson(req,10_000), key=String(input.apiKey||'').trim(), provider=detectProvider(key);
+      if(!provider) { sendJson(res,422,{error:'Could not identify this key. Supported: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, and xAI.'}); return; }
+      const modelName=String(input.model||providerDetails[provider].model).trim().slice(0,160);
+      if(!modelName) { sendJson(res,400,{error:'Enter a model ID.'}); return; }
+      const entry={id:randomUUID(),kind:'byok',provider,key,model:modelName,name:String(input.name||`${providerDetails[provider].label} · ${modelName}`).trim().slice(0,80),label:String(input.name||`${providerDetails[provider].label} · ${modelName}`).trim().slice(0,80),vision:true,supportsCaptions:providerDetails[provider].captions};
+      byokModels.push(entry); aiSelection={mode:'byok',modelId:entry.id};
+      sendJson(res,200,{...aiSelection,model:publicModel(entry),models:await modelCatalog()}); return;
+    } catch(error) { sendJson(res,400,{error:error.message||'Unable to add this model.'}); return; }
+  }
+  if (req.url === '/api/ai/selection' && req.method === 'POST') {
+    try {
+      const input=await readJson(req,10_000), mode=['auto','local','byok'].includes(input.mode)?input.mode:null;
+      if(!mode) { sendJson(res,422,{error:'Choose Auto, Local, or BYOK mode.'}); return; }
+      const models=await modelCatalog(), modelId=String(input.modelId||'auto');
+      if(mode==='auto') aiSelection={mode,modelId:'auto'};
+      else {
+        const selected=models.find(item=>item.id===modelId&&item.kind===(mode==='local'?'local':'byok'));
+        if(!selected) { sendJson(res,422,{error:`Add or select an available ${mode==='local'?'local':'BYOK'} model first.`}); return; }
+        aiSelection={mode,modelId};
+      }
+      sendJson(res,200,{...aiSelection,models}); return;
+    } catch(error) { sendJson(res,400,{error:error.message||'Unable to update AI model selection.'}); return; }
+  }
+  const byokModelMatch=req.url?.match(/^\/api\/ai\/models\/([a-f0-9-]{36})$/);
+  if(byokModelMatch&&req.method==='DELETE') {
+    const index=byokModels.findIndex(item=>item.id===byokModelMatch[1]);
+    if(index<0) { sendJson(res,404,{error:'BYOK model not found.'}); return; }
+    byokModels.splice(index,1);
+    if(aiSelection.modelId===byokModelMatch[1]) aiSelection={mode:'auto',modelId:'auto'};
+    sendJson(res,200,{...aiSelection,models:await modelCatalog()}); return;
+  }
   if (req.url === '/api/settings/provider-key' && req.method === 'GET') {
-    sendJson(res,200,providerStatus()); return;
+    sendJson(res,200,{...providerStatus(),...aiSelection,models:publicByokModels()}); return;
   }
   if (req.url === '/api/settings/provider-key' && req.method === 'DELETE') {
-    byokConfig=null; sendJson(res,200,providerStatus()); return;
+    byokModels.splice(0,byokModels.length); aiSelection={mode:'auto',modelId:'auto'}; sendJson(res,200,{...providerStatus(),...aiSelection,models:publicByokModels()}); return;
   }
   if (req.url === '/api/settings/provider-key' && req.method === 'POST') {
     try {
       const input=await readJson(req,10_000), key=String(input.apiKey||'').trim();
       const provider=detectProvider(key);
-      if(!provider) { sendJson(res,422,{error:'Could not identify this key. Supported key formats: OpenAI, Anthropic, Gemini, Groq, OpenRouter, and xAI.'}); return; }
-      byokConfig={provider,key,model:String(input.model||providerDetails[provider].model).slice(0,160)};
-      sendJson(res,200,providerStatus()); return;
+      if(!provider) { sendJson(res,422,{error:'Could not identify this key. Supported key formats: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, and xAI.'}); return; }
+      const entry={id:randomUUID(),kind:'byok',provider,key,model:String(input.model||providerDetails[provider].model).slice(0,160),name:String(input.name||`${providerDetails[provider].label} · ${input.model||providerDetails[provider].model}`).slice(0,80),label:String(input.name||providerDetails[provider].label),vision:true,supportsCaptions:providerDetails[provider].captions};
+      byokModels.push(entry); aiSelection={mode:'byok',modelId:entry.id};
+      sendJson(res,200,{...providerStatus(),...aiSelection,models:publicByokModels()}); return;
     } catch(error) { sendJson(res,400,{error:error.message||'Unable to configure provider.'}); return; }
   }
   const mediaMatch = req.url?.match(/^\/api\/media\/([a-f0-9-]{36})$/);
@@ -248,12 +370,12 @@ const server = createServer(async (req, res) => {
     } catch(error) { sendJson(res,400,{error:error.message}); return; }
   }
   if (req.method === 'POST' && req.url === '/api/captions') {
-    const captionProvider=activeProvider();
+    const captionProvider=transcriptionProvider();
     if (!captionProvider||!providerDetails[captionProvider.provider].captions) { sendJson(res,503,{error:'Automatic captions require an OpenAI or Groq API key. Set one in AI Provider Settings.'}); return; }
     try {
       const input=await readJson(req); const source=assetPath(input.assetId); const metadata=await probe(source);
       if(!metadata.audio) throw new Error('This media has no audio track to caption.');
-      const segments=await transcribeMedia(source);
+      const segments=await transcribeMedia(source,captionProvider);
       sendJson(res,200,{duration:metadata.duration,segments}); return;
     } catch(error) { sendJson(res,500,{error:error.message||'Caption generation failed.'}); return; }
   }
@@ -327,47 +449,53 @@ const server = createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) { raw += chunk; if (raw.length > 100_000) throw new Error('Request is too large.'); }
     const input = JSON.parse(raw);
-    const aiConfig = activeProvider();
-    const useLocal = !aiConfig;
-    const localToken = process.env.LM_STUDIO_API_TOKEN || process.env.LM_API_TOKEN;
-    const localVision = useLocal && Boolean(localToken);
     const prompt = String(input.prompt || '').slice(0, 4000);
+    const chosenModel=await resolveAiModel(input,prompt);
+    const useLocal=chosenModel.kind==='local';
+    const aiConfig=useLocal?null:chosenModel;
+    const chosenLocalModel=useLocal?chosenModel.model:localModel;
+    const localToken = process.env.LM_STUDIO_API_TOKEN || process.env.LM_API_TOKEN;
+    const localVision = useLocal && Boolean(localToken) && Boolean(chosenModel.vision);
     const clips = Array.isArray(input.clips) ? input.clips.slice(0, 20).map(c => ({assetId:String(c.assetId||''),name:String(c.name||'Clip').slice(0,180),durationSeconds:Number(c.durationSeconds)||0,trimStart:Number(c.trimStart)||0,trimEnd:Number(c.trimEnd)||0})) : [];
     if(!clips.length) throw new Error('Add media to the timeline before asking AI to edit.');
-    const wantsTranscript=Boolean(input.includeTranscript)||/dialogue|speech|word|quote|caption|subtitle|transcript/i.test(prompt);
+    const wantsTranscript=Boolean(input.includeTranscript)||/dialogue|speech|spoken|exact words|quote|caption|subtitle|transcript|transcribe|what .* say/i.test(prompt);
+    const transcriptConfig=aiConfig&&providerDetails[aiConfig.provider]?.captions?aiConfig:(wantsTranscript&&input.aiMode==='auto'?transcriptionProvider():null);
     const evidence=[];
     for(let i=0;i<clips.length;i++) {
       const clip=clips[i]; if(!/^[a-f0-9-]{36}$/.test(clip.assetId)) throw new Error(`Clip ${i+1} has no valid local media asset.`);
       const source=assetPath(clip.assetId), metadata=await probe(source); clip.metadata=metadata;
       const start=Math.max(0,clip.trimStart), end=Math.min(metadata.duration,clip.trimEnd||metadata.duration);
       const frames=(!useLocal||localVision)&&metadata.width?await sampleFrames(source,start,end,2):[];
-      const transcript=aiConfig&&wantsTranscript&&metadata.audio&&providerDetails[aiConfig.provider].captions?(await transcribeMedia(source)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
+      const transcript=transcriptConfig&&wantsTranscript&&metadata.audio?(await transcribeMedia(source,transcriptConfig)).filter(s=>s.end>start&&s.start<end).slice(0,100):[];
       evidence.push({index:i,name:clip.name,trimStart:start,trimEnd:end,metadata,transcript,frames});
     }
     if(useLocal) {
       if(localVision) {
-        const localContent=[{type:'text',text:`User request: ${prompt}. You may inspect only the labeled sampled frames and media metadata below, not every moment. Do not invent events. Return a concise plan and conservative, reviewable cut decisions in timeline order. Preserve uncertain shots. Captions enabled: ${Boolean(input.captionsEnabled)}.`}];
+        const localContent=[{type:'text',text:`User request: ${prompt}. Work like a careful human editor: interpret the brief, review every supplied sample, build a hook-to-payoff rough cut, refine pacing and continuity, then check audio, captions, color, and delivery. Use only edits represented by supported cut/reorder decisions. Never claim an action was executed. You may inspect only the labeled sampled frames and metadata, not every moment. Preserve uncertain shots; keep cuts inside the supplied ranges. Captions enabled: ${Boolean(input.captionsEnabled)}. Return a concise process and evidence-based cut decisions.`}];
         for(const item of evidence){localContent.push({type:'text',text:`CLIP ${item.index} ${item.name}, trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)} seconds. Technical metadata: ${JSON.stringify(item.metadata)}`});for(const frame of item.frames){localContent.push({type:'text',text:`Clip ${item.index} sample at ${frame.time.toFixed(2)} seconds`});localContent.push({type:'image_url',image_url:{url:`data:image/jpeg;base64,${frame.data}`}});}}
         const base=(process.env.LM_STUDIO_BASE_URL||'http://127.0.0.1:1234/v1').replace(/\/$/,'');
-        const localResponse=await fetch(`${base}/chat/completions`,{method:'POST',headers:{Authorization:`Bearer ${localToken}`,'Content-Type':'application/json'},body:JSON.stringify({model:localModel,messages:[{role:'system',content:'You are Cut Studio, a careful video editor. Never claim an edit was executed.'},{role:'user',content:localContent}],temperature:0.2,max_tokens:1800,response_format:{type:'json_schema',json_schema:{name:'cut_studio_edit_plan',strict:true,schema}}})});
+        const localResponse=await fetch(`${base}/chat/completions`,{method:'POST',headers:{Authorization:`Bearer ${localToken}`,'Content-Type':'application/json'},body:JSON.stringify({model:chosenLocalModel,messages:[{role:'system',content:'You are Cut Studio, an experienced and careful human video editor. Return evidence-based edits only and never claim they were applied.'},{role:'user',content:localContent}],temperature:0.2,max_tokens:3000,response_format:{type:'json_schema',json_schema:{name:'cut_studio_edit_plan',strict:true,schema}}})});
         const payload=await localResponse.json();
         if(!localResponse.ok) throw new Error(payload?.error?.message||`LM Studio vision request failed (${localResponse.status}).`);
         const text=payload.choices?.[0]?.message?.content;
-        if(!text) throw new Error(`Local vision model ${localModel} returned no edit plan.`);
-        const result=JSON.parse(text); result.engine='local'; result.model=localModel;
+        if(!text) throw new Error(`Local vision model ${chosenLocalModel} returned no edit plan.`);
+        const result=JSON.parse(text); result.engine='local'; result.model=chosenLocalModel; result.routerReason=chosenModel.reason;
         result.editDecisions=(result.editDecisions||[]).filter(d=>Number.isInteger(d.clipIndex)&&d.clipIndex>=0&&d.clipIndex<clips.length).map(d=>{const clip=clips[d.clipIndex],lo=Math.max(0,clip.trimStart),hi=Math.min(clip.durationSeconds,clip.trimEnd||clip.durationSeconds);let a=Math.max(lo,Math.min(hi,Number(d.inPoint))),b=Math.max(lo,Math.min(hi,Number(d.outPoint)));if(b-a<0.3){a=lo;b=hi;}return {...d,position:Math.max(0,Math.min(clips.length-1,Number(d.position)||0)),inPoint:a,outPoint:b};});
         res.writeHead(200, {'Content-Type':'application/json'}).end(JSON.stringify(result)); return;
       }
-      const clipSummary=evidence.map(c=>`${c.index}: ${c.name}, ${c.trimEnd-c.trimStart}s, ${c.metadata.width||'audio'}x${c.metadata.height||''}, ${c.metadata.fps||0}fps`).join('; ');
-      const localPrompt=`For this request: "${prompt.slice(0,500)}". Give one practical edit action in under 20 words. You cannot see or hear the clips. Do not invent content or repeat technical metadata. If content is unknown, tell the editor what to review before choosing a cut. Clip facts: ${clipSummary}`;
-      const local = await runLocalChat(localPrompt);
+      const clipSummary=evidence.map(c=>`${c.index}: ${c.name}, ${(c.trimEnd-c.trimStart).toFixed(1)}s, ${c.metadata.width||'audio'}x${c.metadata.height||''}, ${c.metadata.fps||0}fps`).join('; ');
+      const localPrompt=`User brief: "${prompt.slice(0,1000)}". Timeline facts: ${clipSummary}. You are a human editor with metadata only: you cannot see frames or hear sound. Never invent footage events, dialogue, trims, or claim to inspect audio. Think through brief, organize clips, propose a story/pacing approach, then note checks for picture, audio, captions, and export. Return JSON with title, summary, steps (order/action/detail), and editDecisions: []. Keep it concise and evidence-aware.`;
+      const local = await runLocalChat(localPrompt,chosenLocalModel,'You are Cut Studio, a meticulous human editor. Output valid JSON only. Never claim to have applied an edit.');
       const cleaned=(local.stdout||'').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\u001b\][^\u0007]*(?:\u0007|$)/g,'').trim();
-      if(!cleaned) throw new Error(`Local model ${localModel} returned an empty recommendation.`);
-      const summary=cleaned.slice(-1500).trim();
-      const result={title:'Local AI edit plan',summary,steps:[{order:1,action:'Editing recommendation',detail:summary},{order:2,action:'Review and refine',detail:'Preview the full clips, then adjust trims and sequence in the timeline. This local text model did not inspect frames or audio.'}],editDecisions:[],engine:'local',model:localModel};
+      if(!cleaned) throw new Error(`Local model ${chosenLocalModel} returned an empty recommendation.`);
+      const jsonStart=cleaned.indexOf('{'),jsonEnd=cleaned.lastIndexOf('}');
+      let result;
+      if(jsonStart>=0&&jsonEnd>jsonStart) { try { result=JSON.parse(cleaned.slice(jsonStart,jsonEnd+1)); } catch {} }
+      if(!result||typeof result!=='object') { const summary=cleaned.slice(-1500).trim(); result={title:'Local AI edit plan',summary,steps:[{order:1,action:'Review the footage',detail:'This local text model only received filenames and technical metadata. Inspect the clips before choosing trims.'},{order:2,action:'Refine and check delivery',detail:'Review pacing, audio, captions, picture, and the final render.'}],editDecisions:[]}; }
+      result.engine='local'; result.model=chosenLocalModel; result.routerReason=chosenModel.reason;
       res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(result)); return;
     }
-    const content=[{type:'input_text',text:`User request: ${prompt}\nCaptions enabled: ${Boolean(input.captionsEnabled)}. You can inspect only supplied sampled frames and transcript excerpts, not every moment. Samples are approximate. Never invent unseen actions or claim edits were executed. Return cut proposals only when evidence supports them; preserve uncertain clips. Keep in/out within each supplied trim range and at least 0.3 seconds for kept clips. Include a concise practical process and a reason for every proposed cut.`}];
+    const content=[{type:'input_text',text:`User request: ${prompt}\nAct like a meticulous human editor working in visible passes: interpret the brief; review each supplied clip sample and technical properties; find a story arc and choose a hook; build a rough cut; refine trims, order, and pacing; then list checks for continuity, sound, captions, color, and delivery. Only propose changes the editor can actually apply in this timeline (trim, keep/remove, reorder); describe other finishing work as review steps, not completed actions. Captions enabled: ${Boolean(input.captionsEnabled)}. You can inspect only supplied sampled frames and transcript excerpts, not every moment; samples are approximate. Never invent unseen actions or claim edits were executed. Preserve uncertain clips. Keep in/out within each supplied trim range and at least 0.3 seconds for kept clips. Include a concise, ordered human-editing process and evidence-based reason for every proposed cut.`}];
     for(const item of evidence){content.push({type:'input_text',text:`CLIP ${item.index} (${item.name}), trim ${item.trimStart.toFixed(2)}-${item.trimEnd.toFixed(2)}s; metadata ${JSON.stringify(item.metadata)}; transcript ${JSON.stringify(item.transcript)}`});for(const frame of item.frames){content.push({type:'input_text',text:`Sample from clip ${item.index} at source ${frame.time.toFixed(2)}s`});content.push({type:'input_image',image_url:`data:image/jpeg;base64,${frame.data}`,detail:'low'});}}
     let text;
     if(aiConfig.provider==='openai') {
@@ -400,7 +528,7 @@ const server = createServer(async (req, res) => {
     }
     if (!text) throw new Error('AI returned no edit plan.');
     const result=JSON.parse(text);
-    result.engine='byok'; result.provider=aiConfig.provider;
+    result.engine='byok'; result.provider=aiConfig.label||providerDetails[aiConfig.provider].label; result.model=aiConfig.model; result.routerReason=chosenModel.reason;
     result.editDecisions=(result.editDecisions||[]).filter(d=>Number.isInteger(d.clipIndex)&&d.clipIndex>=0&&d.clipIndex<clips.length).map(d=>{const clip=clips[d.clipIndex],lo=Math.max(0,clip.trimStart),hi=Math.min(clip.durationSeconds,clip.trimEnd||clip.durationSeconds);let a=Math.max(lo,Math.min(hi,Number(d.inPoint))),b=Math.max(lo,Math.min(hi,Number(d.outPoint)));if(b-a<0.3){a=lo;b=hi;}return {...d,position:Math.max(0,Math.min(clips.length-1,Number(d.position)||0)),inPoint:a,outPoint:b};});
     res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(result));
   } catch (error) {

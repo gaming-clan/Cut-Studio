@@ -1,5 +1,7 @@
 # Cut Studio
 
+![Cut Studio icon](assets/cut_studio_icon.svg)
+
 Cut Studio is a Flutter video editor with a local media-processing backend. The backend is required for importing video, preview streaming, AI, caption generation, and exports.
 
 ## Requirements
@@ -18,7 +20,9 @@ cd backend
 npm install
 ```
 
-Start LM Studio and load a local model, then run the backend. The AI planner uses `lms chat` locally by default, so it does not need a cloud key. In Cut Studio, open the key icon in the top bar to add a provider key. The app recognizes OpenAI, Anthropic, Google Gemini, Groq, NVIDIA NIM, OpenRouter, and xAI key formats, then routes AI edit planning to that provider. NVIDIA keys use the `nvapi-` format and NVIDIA's hosted chat-completions endpoint. Keys are held in backend process memory only and cleared when the backend restarts. They are not written to the Flutter app or backend data directory. Automatic speech transcription is available with OpenAI and Groq keys.
+Start LM Studio and load a local model, then run the backend. Cut Studio discovers local LLMs with `lms ls --llm --json` and lets you choose a specific local model. In the AI Assistant, switch between Auto, Local Models, and BYOK Models. Auto matches the brief to task capabilities: it favors a local vision model when available, a transcription-capable provider for speech-heavy requests, and otherwise a vision-capable BYOK model or the strongest local text model. The reason for each automatic choice appears with the edit plan.
+
+Open AI Model Settings with the key icon to add multiple named BYOK model entries. Each entry has a provider key and optional model ID, so you can save multiple models from the same or different providers and select them from the model dropdown. The app recognizes OpenAI, Anthropic, Google Gemini, Groq, NVIDIA NIM, OpenRouter, and xAI key formats. NVIDIA keys use the `nvapi-` format and NVIDIA's hosted chat-completions endpoint. Keys are held in backend process memory only and cleared when the backend restarts; they are not written to the Flutter app or backend data directory. Automatic speech transcription is available with OpenAI and Groq keys.
 
 For LM Studio frame analysis, create a local API token and set `LM_STUDIO_API_TOKEN`; that route sends sampled frames to the local vision model. The text-only CLI fallback never claims to inspect frames or audio.
 
@@ -77,4 +81,4 @@ Do not place provider keys in Flutter source or a mobile app bundle. BYOK settin
 
 With a provider key, the AI planner samples two frames from each timeline clip and can transcribe speech when a request asks about dialogue, quotes, captions, or a transcript (OpenAI and Groq only). Without a provider key, it calls the installed LM Studio model through `lms chat` and returns a text-only suggestion grounded in filenames and FFprobe metadata. To use a local vision model, set `LM_STUDIO_API_TOKEN`; the backend then sends sampled frames to the LM Studio OpenAI-compatible local API. The text-only mode does not invent trims or pretend to see footage. Review any vision-based cut proposal before applying it.
 
-The editing workflow follows the supplied production guide: inspect source stream properties; preserve originals in the uploads area; organize the timeline; use evidence-based cuts; normalize picture and audio; choose framing and caption format; encode to a delivery profile; then check output metadata and review playback around cuts, captions, sync, picture, and sound. Technical QC cannot judge whether the story or color treatment is editorially right. Uploaded sources remain separate from generated exports.
+The AI planner follows an editorial pass: read the brief, inspect available clip evidence, form a rough story arc, propose trims and clip order, then list finishing and delivery checks. Applying the plan visibly steps through the clips, previews each one, applies supported trims/removals/reordering, and refreshes the timeline. It presents advice for color, audio, captions, or transitions as review steps when those changes are not directly represented by timeline operations; it does not claim they have been applied. The broader render workflow follows the supplied production guide: inspect source stream properties; preserve originals in the uploads area; normalize picture and audio; choose framing and caption format; encode to a delivery profile; then check output metadata and review playback around cuts, captions, sync, picture, and sound. Technical QC cannot judge whether the story or color treatment is editorially right. Uploaded sources remain separate from generated exports.
