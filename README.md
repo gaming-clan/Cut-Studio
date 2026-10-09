@@ -50,6 +50,14 @@ flutter pub get
 flutter run -d chrome
 ```
 
+Build the native Windows desktop app after installing Visual Studio Build Tools with the Desktop development with C++ workload:
+
+```powershell
+flutter build windows --release
+```
+
+The executable and its required runtime files are in `build/windows/x64/runner/Release/`. Start the media/AI backend separately from the `backend/` directory (`npm install` once, then `npm start`); the desktop app connects to `http://localhost:8787` by default. FFmpeg and FFprobe must be on PATH. AI edit planning uses LM Studio locally unless a provider key is configured in the app.
+
 Use a generated Windows runner for native Windows preview. The project includes the Windows `video_player` implementation. Configure a reachable backend endpoint when needed:
 
 ```sh
