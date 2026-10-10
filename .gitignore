@@ -1,0 +1,17 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub-cache/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.idea/
+*.iml
+test/widget_test.dart
+
+# Node backend dependencies and user media / exports
+backend/node_modules/
+backend/data/
+.env
+.env.*
+!.env.example

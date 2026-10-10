@@ -1,5 +1,13 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:typed_data';
+import 'project_file_stub.dart' if (dart.library.io) 'project_file_io.dart'
+    as project_storage;
 import 'package:file_picker/file_picker.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:video_player/video_player.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() => runApp(const CutStudioApp());
 
@@ -30,13 +38,86 @@ class EditorScreen extends StatefulWidget {
   State<EditorScreen> createState() => _EditorScreenState();
 }
 
-class _EditorScreenState extends State<EditorScreen> {
+class _EditorScreenState extends State<EditorScreen>
+    with WidgetsBindingObserver {
   String _tool = 'Edit';
-  bool _playing = false;
   bool _captions = true;
+  bool _aiBusy = false;
+  bool _mediaBusy = false;
+  bool _renderBusy = false;
+  bool _applyingAiEdits = false;
+  bool _modelsBusy = false;
+  bool _removeSilences = false;
+  String _providerLabel = 'Checking…';
+  String _aiMode = 'auto';
+  String _selectedModelId = 'auto';
+  String? _editorAction;
+  List<Map<String, dynamic>> _aiModels = [];
+  final TextEditingController _apiKeyController = TextEditingController();
+  final TextEditingController _modelNameController = TextEditingController();
+  final TextEditingController _modelIdController = TextEditingController();
+  VideoPlayerController? _previewController;
+  final List<String> _assetIds = [];
+  final List<double> _durations = [];
+  final List<RangeValues> _trimRanges = [];
+  final List<Map<String, dynamic>> _captionSegments = [];
+  String _exportResolution = '1080p';
+  String _exportAspect = '16:9';
+  String _captionMode = 'soft';
+  String? _musicAssetId;
+  String? _musicFileName;
+  double _musicVolume = .18;
+  static const _aiEndpoint = String.fromEnvironment('AI_API_URL',
+      defaultValue: 'http://localhost:8787/api/edit-plan');
   final List<PlatformFile> _media = [];
-  String _projectName = 'Summer campaign / v04';
-  int _selectedClip = 0;
+  final List<int> _timelineMedia = [];
+  final TextEditingController _promptController = TextEditingController();
+  final Map<String, double> _adjustments = {
+    'Exposure': .58,
+    'Contrast': .64,
+    'Saturation': .71
+  };
+  String _projectName = 'Untitled project';
+  String _projectStatus = 'Starting…';
+  String? _projectFilePath;
+  Timer? _autosaveTimer;
+  Future<bool>? _autosaveInFlight;
+  bool _autosavePending = false;
+  bool _projectReady = false;
+  bool _projectBusy = false;
+  int _selectedClip = -1;
+  final List<_TimelineSnapshot> _undoStack = [];
+  final List<_TimelineSnapshot> _redoStack = [];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refreshAiModels();
+    _restoreAutosave();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _autosaveTimer?.cancel();
+    _promptController.dispose();
+    _apiKeyController.dispose();
+    _modelNameController.dispose();
+    _modelIdController.dispose();
+    _previewController?.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _autosaveTimer?.cancel();
+      _persistAutosave();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -70,24 +151,79 @@ class _EditorScreenState extends State<EditorScreen> {
           border: Border(bottom: BorderSide(color: Color(0xFF25262A))),
         ),
         child: Row(children: [
-          const Icon(Icons.movie_creation_outlined, color: Color(0xFFB8F36B)),
+          Image.asset('assets/cut_studio_icon.png', width: 30, height: 30),
           const SizedBox(width: 10),
-          const Text('CUTSTUDIO', style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.5)),
+          const Text('CUTSTUDIO',
+              style:
+                  TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.5)),
           const SizedBox(width: 24),
           const VerticalDivider(indent: 16, endIndent: 16),
           const SizedBox(width: 16),
-          Expanded(child: Text(_projectName, style: const TextStyle(color: Colors.white70))),
-          const Icon(Icons.cloud_done_outlined, size: 18, color: Colors.white54),
+          Expanded(
+              child: Row(children: [
+            Expanded(
+                child: Text(_projectName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70))),
+            PopupMenuButton<_ProjectMenuAction>(
+              enabled: _projectReady && !_projectBusy,
+              tooltip: 'Project file actions',
+              onSelected: _handleProjectMenu,
+              itemBuilder: (context) => const [
+                PopupMenuItem(
+                    value: _ProjectMenuAction.newProject,
+                    child: Text('New project')),
+                PopupMenuItem(
+                    value: _ProjectMenuAction.open,
+                    child: Text('Open project…')),
+                PopupMenuItem(
+                    value: _ProjectMenuAction.save,
+                    child: Text('Save project')),
+                PopupMenuItem(
+                    value: _ProjectMenuAction.saveAs,
+                    child: Text('Save project as…')),
+                PopupMenuItem(
+                    value: _ProjectMenuAction.rename,
+                    child: Text('Rename project')),
+              ],
+              icon: const Icon(Icons.folder_open_outlined, size: 19),
+            ),
+          ])),
+          Icon(_projectStatus == 'Saved' ? Icons.save_outlined : Icons.sync,
+              size: 18,
+              color: _projectStatus == 'Saved'
+                  ? const Color(0xFFB8F36B)
+                  : Colors.white54),
           const SizedBox(width: 8),
-          const Text('Saved', style: TextStyle(color: Colors.white54, fontSize: 12)),
+          Text(_projectStatus,
+              style: const TextStyle(color: Colors.white54, fontSize: 12)),
           const SizedBox(width: 20),
-          OutlinedButton.icon(onPressed: _showExport, icon: const Icon(Icons.ios_share, size: 16), label: const Text('Export')),
+          IconButton(
+              tooltip: 'AI models and API keys',
+              onPressed: _showAiModelsSettings,
+              icon: const Icon(Icons.key_outlined)),
+          IconButton(
+              tooltip: 'Undo timeline edit',
+              onPressed: _undoStack.isEmpty ? null : _undoTimeline,
+              icon: const Icon(Icons.undo)),
+          IconButton(
+              tooltip: 'Redo timeline edit',
+              onPressed: _redoStack.isEmpty ? null : _redoTimeline,
+              icon: const Icon(Icons.redo)),
+          OutlinedButton.icon(
+              onPressed: _showExport,
+              icon: const Icon(Icons.ios_share, size: 16),
+              label: const Text('Export')),
           const SizedBox(width: 10),
           FilledButton.icon(
-            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB8F36B), foregroundColor: const Color(0xFF171A12)),
-            onPressed: _generateEdit,
-            icon: const Icon(Icons.auto_awesome, size: 16),
-            label: const Text('AI edit'),
+            style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFB8F36B),
+                foregroundColor: const Color(0xFF171A12)),
+            onPressed: _aiBusy ? null : _generateEdit,
+            icon: Icon(_aiBusy ? Icons.hourglass_top : Icons.auto_awesome,
+                size: 16),
+            label: Text(_aiBusy ? 'Planning…' : 'AI edit'),
           ),
         ]),
       );
@@ -97,19 +233,26 @@ class _EditorScreenState extends State<EditorScreen> {
           child: Container(
             margin: const EdgeInsets.all(18),
             width: double.infinity,
-            decoration: BoxDecoration(color: const Color(0xFF08090B), borderRadius: BorderRadius.circular(14)),
+            decoration: BoxDecoration(
+                color: const Color(0xFF08090B),
+                borderRadius: BorderRadius.circular(14)),
             child: Stack(alignment: Alignment.center, children: [
               Positioned.fill(
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(14),
-                  child: Image.network(
-                    'https://images.unsplash.com/photo-1470252649378-9c29740c9fa8?auto=format&fit=crop&w=1600&q=85',
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => const _PreviewFallback(),
-                  ),
+                  child: _previewController?.value.isInitialized == true
+                      ? Center(
+                          child: AspectRatio(
+                              aspectRatio:
+                                  _previewController!.value.aspectRatio,
+                              child: VideoPlayer(_previewController!)))
+                      : const _PreviewFallback(),
                 ),
               ),
-              Positioned.fill(child: DecoratedBox(decoration: BoxDecoration(color: Colors.black.withValues(alpha: .23)))),
+              Positioned.fill(
+                  child: DecoratedBox(
+                      decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: .23)))),
               Positioned(
                 left: 24,
                 top: 20,
@@ -120,70 +263,198 @@ class _EditorScreenState extends State<EditorScreen> {
                 top: 20,
                 child: _tag(Icons.auto_awesome, 'AI color grade'),
               ),
-              Column(mainAxisSize: MainAxisSize.min, children: [
-                const Text('A little more golden hour.', style: TextStyle(fontSize: 29, fontWeight: FontWeight.w600, shadows: [Shadow(color: Colors.black54, blurRadius: 12)])),
-                const SizedBox(height: 12),
-                Container(width: 260, height: 3, decoration: BoxDecoration(color: Colors.white30, borderRadius: BorderRadius.circular(5)), child: Align(alignment: Alignment.centerLeft, child: Container(width: 92, decoration: BoxDecoration(color: const Color(0xFFB8F36B), borderRadius: BorderRadius.circular(5))))),
-              ]),
               Positioned(
                 bottom: 18,
                 child: Row(children: [
-                  IconButton(onPressed: () => setState(() => _playing = !_playing), icon: Icon(_playing ? Icons.pause_rounded : Icons.play_arrow_rounded, size: 30)),
-                  const Text('00:12.4', style: TextStyle(fontFeatures: [])),
-                  const Text('  /  00:48.0', style: TextStyle(color: Colors.white54)),
+                  IconButton(
+                      onPressed: _togglePlayback,
+                      icon: Icon(
+                          _previewController?.value.isPlaying == true
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          size: 30)),
+                  Text(
+                      _formatDuration(
+                          _previewController?.value.position ?? Duration.zero),
+                      style: const TextStyle(fontFeatures: [])),
+                  Text(
+                      '  /  ${_formatDuration(_previewController?.value.duration ?? Duration.zero)}',
+                      style: const TextStyle(color: Colors.white54)),
                   const SizedBox(width: 24),
-                  IconButton(onPressed: () => _toast('Volume controls'), icon: const Icon(Icons.volume_up_outlined)),
-          IconButton(onPressed: () => _showExport(), icon: const Icon(Icons.fullscreen)),
+                  IconButton(
+                      onPressed: () => _toast('Volume controls'),
+                      icon: const Icon(Icons.volume_up_outlined)),
+                  IconButton(
+                      onPressed: () => _showExport(),
+                      icon: const Icon(Icons.fullscreen)),
                 ]),
               ),
             ]),
           ),
         ),
-        if (MediaQuery.sizeOf(context).width > 900) SizedBox(height: 282, child: _timeline()),
+        if (MediaQuery.sizeOf(context).width > 900)
+          SizedBox(height: 282, child: _timeline()),
       ]);
 
   Widget _timeline() => Container(
         margin: const EdgeInsets.fromLTRB(18, 0, 18, 16),
         padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(color: const Color(0xFF18191D), borderRadius: BorderRadius.circular(12), border: Border.all(color: const Color(0xFF28292E))),
+        decoration: BoxDecoration(
+            color: const Color(0xFF18191D),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: const Color(0xFF28292E))),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(children: [
-            const Text('TIMELINE', style: TextStyle(fontSize: 11, letterSpacing: 1.3, color: Colors.white54, fontWeight: FontWeight.w700)),
+            const Text('TIMELINE',
+                style: TextStyle(
+                    fontSize: 11,
+                    letterSpacing: 1.3,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.w700)),
             const SizedBox(width: 16),
-            const Text('00:12.4', style: TextStyle(fontSize: 12)),
+            Expanded(
+                child: Text(
+                    _selectedClip >= 0 && _selectedClip < _timelineMedia.length
+                        ? _media[_timelineMedia[_selectedClip]].name
+                        : 'No clip selected',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12))),
+            IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Move clip left',
+                onPressed: () => _moveSelectedClip(-1),
+                icon: const Icon(Icons.chevron_left, size: 18)),
+            IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Move clip right',
+                onPressed: () => _moveSelectedClip(1),
+                icon: const Icon(Icons.chevron_right, size: 18)),
+            IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Remove clip',
+                onPressed: _removeSelectedClip,
+                icon: const Icon(Icons.delete_outline, size: 17)),
             const Spacer(),
-            IconButton(visualDensity: VisualDensity.compact, onPressed: () => _toast('Timeline zoomed out'), icon: const Icon(Icons.remove, size: 17)),
-            const Text('100%', style: TextStyle(fontSize: 11, color: Colors.white54)),
-            IconButton(visualDensity: VisualDensity.compact, onPressed: () => _toast('Timeline zoomed in'), icon: const Icon(Icons.add, size: 17)),
+            Text(
+                '${_timelineMedia.length} clip${_timelineMedia.length == 1 ? '' : 's'}',
+                style: const TextStyle(fontSize: 11, color: Colors.white54)),
           ]),
           const SizedBox(height: 10),
-          _track('VIDEO 1', const Color(0xFF648850), const [0.92, 1.28, .82, 1.05, .72]),
+          _track(
+              'VIDEO 1',
+              const Color(0xFF648850),
+              _timelineMedia
+                  .map((i) => (_trimRanges[i].end - _trimRanges[i].start)
+                      .clamp(.2, 20)
+                      .toDouble())
+                  .toList()),
           const SizedBox(height: 7),
-          _track('TEXT', const Color(0xFF8273B7), const [.66, .54, .82, .5]),
+          _track(
+              'CAPTIONS',
+              const Color(0xFF8273B7),
+              _captionSegments
+                  .map((s) => ((s['end'] as num).toDouble() -
+                          (s['start'] as num).toDouble())
+                      .clamp(.2, 20)
+                      .toDouble())
+                  .toList()),
           const SizedBox(height: 7),
-          _track('MUSIC', const Color(0xFF468E91), const [1.15, .88, 1.24, 1.08, .92]),
-          const SizedBox(height: 7),
-          _track('SFX', const Color(0xFFB08753), const [.38, .3, .48, .26]),
+          _track('MUSIC', const Color(0xFF468E91),
+              _musicAssetId == null || _timelineMedia.isEmpty ? const [] : [1]),
         ]),
       );
 
   Widget _track(String label, Color color, List<double> widths) => Expanded(
         child: Row(children: [
-          SizedBox(width: 66, child: Text(label, style: const TextStyle(fontSize: 9, color: Colors.white54, letterSpacing: .8))),
-          Expanded(child: LayoutBuilder(builder: (context, c) => Stack(children: [
-            Row(children: List.generate(widths.length, (i) => Expanded(flex: (widths[i] * 100).round(), child: Container(
-              margin: const EdgeInsets.only(right: 3),
-              height: 36,
-              decoration: BoxDecoration(color: color.withValues(alpha: .64), borderRadius: BorderRadius.circular(5)),
-            child: label == 'VIDEO 1' ? InkWell(onTap: () => setState(() => _selectedClip++), child: const _MiniThumbnail()) : null,
-            )))),
-            Positioned(left: c.maxWidth * .27, top: 0, bottom: 0, child: Container(width: 2, color: const Color(0xFFB8F36B))),
-          ]))),
+          SizedBox(
+              width: 66,
+              child: Text(label,
+                  style: const TextStyle(
+                      fontSize: 9, color: Colors.white54, letterSpacing: .8))),
+          Expanded(
+              child: LayoutBuilder(
+                  builder: (context, c) => Stack(children: [
+                        if (widths.isEmpty)
+                          Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                  label == 'VIDEO 1'
+                                      ? 'Import footage to begin'
+                                      : label == 'CAPTIONS'
+                                          ? 'No caption segments'
+                                          : 'No background music',
+                                  style: const TextStyle(
+                                      fontSize: 10, color: Colors.white30))),
+                        if (widths.isNotEmpty)
+                          Row(
+                              children: List.generate(
+                                  widths.length,
+                                  (i) => Expanded(
+                                      flex: (widths[i] * 100)
+                                          .round()
+                                          .clamp(20, 2000),
+                                      child: Container(
+                                        margin: const EdgeInsets.only(right: 3),
+                                        height: 36,
+                                        decoration: BoxDecoration(
+                                            color: color.withValues(alpha: .64),
+                                            borderRadius:
+                                                BorderRadius.circular(5),
+                                            border: Border.all(
+                                                color: label == 'VIDEO 1' &&
+                                                        _selectedClip == i
+                                                    ? const Color(0xFFB8F36B)
+                                                    : Colors.transparent)),
+                                        child: label == 'VIDEO 1'
+                                            ? InkWell(
+                                                onTap: () =>
+                                                    _selectTimelineClip(i),
+                                                child: Center(
+                                                    child: Padding(
+                                                        padding:
+                                                            const EdgeInsets.symmetric(
+                                                                horizontal: 5),
+                                                        child: Text(_media[_timelineMedia[i]].name,
+                                                            maxLines: 1,
+                                                            overflow: TextOverflow
+                                                                .ellipsis,
+                                                            style: const TextStyle(
+                                                                fontSize: 9)))))
+                                            : label == 'CAPTIONS'
+                                                ? Center(
+                                                    child: Padding(
+                                                        padding:
+                                                            const EdgeInsets.symmetric(
+                                                                horizontal: 4),
+                                                        child: Text(
+                                                            '${_captionSegments[i]['text']}',
+                                                            maxLines: 1,
+                                                            overflow: TextOverflow.ellipsis,
+                                                            style: const TextStyle(fontSize: 8))))
+                                                : null,
+                                      )))),
+                        if (label == 'VIDEO 1' && widths.isNotEmpty)
+                          Positioned(
+                              left: c.maxWidth * .27,
+                              top: 0,
+                              bottom: 0,
+                              child: Container(
+                                  width: 2, color: const Color(0xFFB8F36B))),
+                      ]))),
         ]),
       );
 
-  Widget _sidePanel() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Padding(padding: EdgeInsets.fromLTRB(18, 20, 18, 10), child: Text('PROJECT', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
+  Widget _sidePanel() =>
+      Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Padding(
+            padding: EdgeInsets.fromLTRB(18, 20, 18, 10),
+            child: Text('PROJECT',
+                style: TextStyle(
+                    fontSize: 10,
+                    letterSpacing: 1.5,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.bold))),
         _panelNav(Icons.perm_media_outlined, 'Media', '12'),
         _panelNav(Icons.music_note_outlined, 'Audio', '4'),
         _panelNav(Icons.title, 'Titles', null),
@@ -191,54 +462,1064 @@ class _EditorScreenState extends State<EditorScreen> {
         _panelNav(Icons.filter_vintage_outlined, 'Effects', null),
         _panelNav(Icons.subtitles_outlined, 'Captions', null),
         const Divider(height: 30, indent: 18, endIndent: 18),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 18), child: Row(children: [const Text('YOUR MEDIA', style: TextStyle(fontSize: 10, letterSpacing: 1.3, color: Colors.white54, fontWeight: FontWeight.bold)), const Spacer(), IconButton(tooltip: 'Import videos', onPressed: _importMedia, icon: const Icon(Icons.add, size: 18))])),
+        Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18),
+            child: Row(children: [
+              const Text('YOUR MEDIA',
+                  style: TextStyle(
+                      fontSize: 10,
+                      letterSpacing: 1.3,
+                      color: Colors.white54,
+                      fontWeight: FontWeight.bold)),
+              const Spacer(),
+              IconButton(
+                  tooltip: 'Import music/audio',
+                  onPressed: _importAudio,
+                  icon: const Icon(Icons.music_note, size: 18)),
+              IconButton(
+                  tooltip: 'Import videos',
+                  onPressed: _importMedia,
+                  icon: const Icon(Icons.add, size: 18))
+            ])),
         const SizedBox(height: 12),
-        Expanded(child: _media.isEmpty
-            ? GridView.count(padding: const EdgeInsets.symmetric(horizontal: 14), crossAxisCount: 2, mainAxisSpacing: 8, crossAxisSpacing: 8, childAspectRatio: 1.5, children: const [
-                _MediaTile(color: Color(0xFF5D684F), icon: Icons.landscape), _MediaTile(color: Color(0xFF5E625C), icon: Icons.waves), _MediaTile(color: Color(0xFF726250), icon: Icons.wb_twilight), _MediaTile(color: Color(0xFF4B6462), icon: Icons.forest),
-              ])
-            : ListView.builder(padding: const EdgeInsets.symmetric(horizontal: 10), itemCount: _media.length, itemBuilder: (context, i) => ListTile(dense: true, leading: const Icon(Icons.video_file_outlined), title: Text(_media[i].name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11)), subtitle: Text(_fileSize(_media[i].size), style: const TextStyle(fontSize: 10)), onTap: () => setState(() => _selectedClip = i))))),
+        Expanded(
+          child: _media.isEmpty
+              ? GridView.count(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 8,
+                  crossAxisSpacing: 8,
+                  childAspectRatio: 1.5,
+                  children: const [
+                    _MediaTile(color: Color(0xFF5D684F), icon: Icons.landscape),
+                    _MediaTile(color: Color(0xFF5E625C), icon: Icons.waves),
+                    _MediaTile(
+                        color: Color(0xFF726250), icon: Icons.wb_twilight),
+                    _MediaTile(color: Color(0xFF4B6462), icon: Icons.forest),
+                  ],
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  itemCount: _media.length,
+                  itemBuilder: (context, i) => ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.video_file_outlined),
+                    title: Text(_media[i].name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 11)),
+                    subtitle: Text(_fileSize(_media[i].size),
+                        style: const TextStyle(fontSize: 10)),
+                    onTap: () => _insertToTimeline(i),
+                  ),
+                ),
+        ),
       ]);
 
-  Widget _inspector() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Padding(padding: EdgeInsets.fromLTRB(18, 20, 18, 14), child: Text('AI ASSISTANT', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Color(0xFFB8F36B), fontWeight: FontWeight.bold))),
-        Padding(padding: const EdgeInsets.symmetric(horizontal: 14), child: Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: const Color(0xFF1D211A), border: Border.all(color: const Color(0xFF39442F)), borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('What should we make?', style: TextStyle(fontWeight: FontWeight.w600)),
-          const SizedBox(height: 10),
-          TextField(maxLines: 3, decoration: InputDecoration(hintText: '“Make this feel like a travel film…”', hintStyle: const TextStyle(fontSize: 12, color: Colors.white38), filled: true, fillColor: const Color(0xFF111310), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none), contentPadding: const EdgeInsets.all(11))),
-          const SizedBox(height: 10),
-          SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _generateEdit, icon: const Icon(Icons.auto_awesome, size: 15), label: const Text('Generate edit'))),
-        ]))),
-        const Padding(padding: EdgeInsets.fromLTRB(18, 24, 18, 8), child: Text('QUICK ACTIONS', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
-        _action(Icons.content_cut, 'Remove silences', 'Tighten the pacing', onTap: () => _showSuggestion('Silence removal', 'Find pauses in dialogue and tighten the cuts while keeping natural breathing room.')),
-        _action(Icons.subtitles, 'Create captions', 'Accurate, styled subtitles', onTap: () => setState(() => _captions = !_captions), trailing: Switch(value: _captions, onChanged: (v) => setState(() => _captions = v))),
-        _action(Icons.graphic_eq, 'Clean up audio', 'Reduce noise, balance levels', onTap: () => _showSuggestion('Audio cleanup', 'Reduce steady background noise, level dialogue, and keep music beneath speech.')),
-        _action(Icons.auto_fix_high, 'Color match', 'Unify every shot', onTap: () => _showSuggestion('Color match', 'Match exposure and white balance across the selected shots, then apply a warm film look.')),
+  List<Map<String, dynamic>> get _selectableModels => _aiModels
+      .where((item) => item['kind'] == (_aiMode == 'local' ? 'local' : 'byok'))
+      .toList();
+
+  Widget _aiModelControls() {
+    final choices = _selectableModels;
+    final hasModeModels = choices.isNotEmpty;
+    final selectedExists =
+        choices.any((item) => item['id'] == _selectedModelId);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(
+            child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+          value: _aiMode,
+          isExpanded: true,
+          style: const TextStyle(fontSize: 12, color: Colors.white),
+          items: const [
+            DropdownMenuItem(
+                value: 'auto', child: Text('Auto · best for task')),
+            DropdownMenuItem(value: 'local', child: Text('Local models')),
+            DropdownMenuItem(value: 'byok', child: Text('BYOK models')),
+          ],
+          onChanged: _modelsBusy
+              ? null
+              : (value) {
+                  if (value != null) _setAiMode(value);
+                },
+        ))),
+        IconButton(
+            tooltip: 'Manage models and keys',
+            onPressed: _showAiModelsSettings,
+            icon: const Icon(Icons.tune, size: 18)),
+      ]),
+      if (_aiMode != 'auto' && hasModeModels)
+        DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+          value:
+              selectedExists ? _selectedModelId : choices.first['id'] as String,
+          isExpanded: true,
+          hint: const Text('Choose a model'),
+          style: const TextStyle(fontSize: 11, color: Colors.white70),
+          items: choices
+              .map((item) => DropdownMenuItem<String>(
+                  value: item['id'] as String,
+                  child: Text(
+                      '${item['name']}${item['vision'] == true ? ' · vision' : ''}',
+                      overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: _modelsBusy
+              ? null
+              : (value) {
+                  if (value != null) _setAiSelection(_aiMode, value);
+                },
+        )),
+      if (_aiMode != 'auto' && !hasModeModels)
+        TextButton.icon(
+            onPressed: _showAiModelsSettings,
+            icon: const Icon(Icons.add, size: 14),
+            label: Text(_aiMode == 'local'
+                ? 'Refresh local models'
+                : 'Add a BYOK model')),
+      if (_aiMode == 'auto') ...[
+        const Text(
+            'Matches the brief to local vision, transcription, or the best available provider model.',
+            style: TextStyle(fontSize: 10, color: Colors.white54)),
+      ],
+    ]);
+  }
+
+  Widget _inspector() => SingleChildScrollView(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Padding(
+            padding: EdgeInsets.fromLTRB(18, 20, 18, 14),
+            child: Text('AI ASSISTANT',
+                style: TextStyle(
+                    fontSize: 10,
+                    letterSpacing: 1.5,
+                    color: Color(0xFFB8F36B),
+                    fontWeight: FontWeight.bold))),
+        Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                    color: const Color(0xFF1D211A),
+                    border: Border.all(color: const Color(0xFF39442F)),
+                    borderRadius: BorderRadius.circular(10)),
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _aiModelControls(),
+                      const SizedBox(height: 12),
+                      const Text('What should we make?',
+                          style: TextStyle(fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 10),
+                      TextField(
+                          controller: _promptController,
+                          maxLines: 3,
+                          decoration: InputDecoration(
+                              hintText: '“Make this feel like a travel film…”',
+                              hintStyle: const TextStyle(
+                                  fontSize: 12, color: Colors.white38),
+                              filled: true,
+                              fillColor: const Color(0xFF111310),
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                  borderSide: BorderSide.none),
+                              contentPadding: const EdgeInsets.all(11))),
+                      const SizedBox(height: 10),
+                      if (_aiBusy || _applyingAiEdits) ...[
+                        Row(children: [
+                          const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                              child: Text(
+                                  _editorAction ??
+                                      'Reviewing your brief and footage…',
+                                  style: const TextStyle(
+                                      fontSize: 11, color: Colors.white70)))
+                        ]),
+                        const SizedBox(height: 10),
+                      ],
+                      SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                              onPressed: _aiBusy || _applyingAiEdits
+                                  ? null
+                                  : _generateEdit,
+                              icon: Icon(
+                                  _aiBusy || _applyingAiEdits
+                                      ? Icons.hourglass_top
+                                      : Icons.auto_awesome,
+                                  size: 15),
+                              label: Text(_aiBusy
+                                  ? 'Editing…'
+                                  : _applyingAiEdits
+                                      ? 'Applying edit…'
+                                      : 'Generate edit'))),
+                    ]))),
+        const Padding(
+            padding: EdgeInsets.fromLTRB(18, 24, 18, 8),
+            child: Text('QUICK ACTIONS',
+                style: TextStyle(
+                    fontSize: 10,
+                    letterSpacing: 1.5,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.bold))),
+        _action(Icons.content_cut, 'Remove silences', 'Tighten the pacing',
+            onTap: () {
+          setState(() => _removeSilences = !_removeSilences);
+          _scheduleAutosave();
+          _toast(_removeSilences
+              ? 'Silence removal will be applied on export'
+              : 'Silence removal turned off');
+          _runQuickAction('Remove silences',
+              'Analyze the selected video and remove long pauses while preserving a short natural breath.');
+        }),
+        _action(
+            Icons.subtitles, 'Create captions', 'Accurate, styled subtitles',
+            onTap: _generateCaptions,
+            trailing: Switch(
+                value: _captions,
+                onChanged: (v) {
+                  setState(() => _captions = v);
+                  _scheduleAutosave();
+                  if (v && _captionSegments.isEmpty) _generateCaptions();
+                })),
+        _action(
+            Icons.graphic_eq, 'Clean up audio', 'Reduce noise, balance levels',
+            onTap: () => _runQuickAction('Clean up audio',
+                'Reduce steady background noise and normalize dialogue loudness.')),
+        _action(Icons.auto_fix_high, 'Color match', 'Unify every shot',
+            onTap: () => _runQuickAction('Color match',
+                'Match exposure and white balance across the selected shots, then suggest a consistent warm film look.')),
         const Divider(height: 26, indent: 18, endIndent: 18),
-        const Padding(padding: EdgeInsets.symmetric(horizontal: 18), child: Text('SELECTED CLIP', style: TextStyle(fontSize: 10, letterSpacing: 1.5, color: Colors.white54, fontWeight: FontWeight.bold))),
+        const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 18),
+            child: Text('SELECTED CLIP',
+                style: TextStyle(
+                    fontSize: 10,
+                    letterSpacing: 1.5,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.bold))),
         const SizedBox(height: 12),
-        _slider('Exposure', .58), _slider('Contrast', .64), _slider('Saturation', .71),
-        const Spacer(),
-      ]);
+        if (_selectedClip >= 0 && _selectedClip < _timelineMedia.length) ...[
+          Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: Row(children: [
+                const Expanded(
+                    child: Text('Trim range',
+                        style: TextStyle(fontSize: 11, color: Colors.white70))),
+                Text(
+                    '${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s — ${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s',
+                    style: const TextStyle(fontSize: 10, color: Colors.white38))
+              ])),
+          Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: RangeSlider(
+                  min: 0,
+                  max: (_durations[_timelineMedia[_selectedClip]])
+                      .clamp(.2, 86400)
+                      .toDouble(),
+                  values: _trimRanges[_timelineMedia[_selectedClip]],
+                  labels: RangeLabels(
+                      '${_trimRanges[_timelineMedia[_selectedClip]].start.toStringAsFixed(1)}s',
+                      '${_trimRanges[_timelineMedia[_selectedClip]].end.toStringAsFixed(1)}s'),
+                  onChangeStart: (_) => _recordUndo(),
+                  onChanged: (value) {
+                    setState(() {
+                      _trimRanges[_timelineMedia[_selectedClip]] = value;
+                      _captionSegments.clear();
+                    });
+                    _scheduleAutosave();
+                    final controller = _previewController;
+                    if (controller != null &&
+                        (controller.value.position <
+                                Duration(
+                                    milliseconds:
+                                        (value.start * 1000).round()) ||
+                            controller.value.position >
+                                Duration(
+                                    milliseconds:
+                                        (value.end * 1000).round()))) {
+                      controller.seekTo(
+                          Duration(milliseconds: (value.start * 1000).round()));
+                    }
+                  })),
+        ],
+        _slider('Exposure', .58),
+        _slider('Contrast', .64),
+        _slider('Saturation', .71),
+      ]));
 
-  Widget _mobileTools() => SizedBox(height: 66, child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: ['Edit', 'AI', 'Captions', 'Audio', 'Export'].map((label) => TextButton(onPressed: () => setState(() => _tool = label), child: Text(label, style: TextStyle(color: _tool == label ? const Color(0xFFB8F36B) : Colors.white60)))).toList()));
-  Widget _panelNav(IconData icon, String label, String? count) => ListTile(dense: true, leading: Icon(icon, size: 19, color: Colors.white70), title: Text(label, style: const TextStyle(fontSize: 13)), trailing: count == null ? null : Text(count, style: const TextStyle(color: Colors.white38, fontSize: 11)));
-  Widget _action(IconData icon, String title, String sub, {Widget? trailing, VoidCallback? onTap}) => ListTile(dense: true, onTap: onTap, leading: Icon(icon, color: const Color(0xFFB8F36B), size: 19), title: Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)), subtitle: Text(sub, style: const TextStyle(fontSize: 10, color: Colors.white45)), trailing: trailing);
-  Widget _slider(String name, double value) => Padding(padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4), child: Column(children: [Row(children: [Expanded(child: Text(name, style: const TextStyle(fontSize: 11, color: Colors.white70))), Text('${(value * 100).round()}', style: const TextStyle(fontSize: 10, color: Colors.white38))]), SizedBox(height: 22, child: Slider(value: value, onChanged: (_) {}, activeColor: const Color(0xFFB8F36B)))]));
-  Widget _tag(IconData icon, String text) => Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7), decoration: BoxDecoration(color: Colors.black.withValues(alpha: .45), borderRadius: BorderRadius.circular(20)), child: Row(children: [Icon(icon, size: 13, color: const Color(0xFFB8F36B)), const SizedBox(width: 6), Text(text, style: const TextStyle(fontSize: 10))]));
-  void _toast(String message) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), behavior: SnackBarBehavior.floating, duration: const Duration(seconds: 2)));
+  Widget _mobileTools() => SizedBox(
+      height: 66,
+      child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: ['Edit', 'AI', 'Captions', 'Audio', 'Export']
+              .map((label) => TextButton(
+                  onPressed: () => _handleMobileTool(label),
+                  child: Text(label,
+                      style: TextStyle(
+                          color: _tool == label
+                              ? const Color(0xFFB8F36B)
+                              : Colors.white60))))
+              .toList()));
+
+  void _handleMobileTool(String label) {
+    setState(() => _tool = label);
+    switch (label) {
+      case 'AI':
+        showDialog<void>(
+            context: context,
+            builder: (dialogContext) => AlertDialog(
+                    title: const Text('AI edit'),
+                    content: TextField(
+                        controller: _promptController,
+                        maxLines: 3,
+                        decoration: const InputDecoration(
+                            hintText: 'Describe the edit you want')),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(dialogContext),
+                          child: const Text('Cancel')),
+                      FilledButton(
+                          onPressed: () {
+                            Navigator.pop(dialogContext);
+                            _generateEdit();
+                          },
+                          child: const Text('Plan edit'))
+                    ]));
+        break;
+      case 'Captions':
+        setState(() => _captions = !_captions);
+        _scheduleAutosave();
+        _toast(_captions ? 'Captions enabled' : 'Captions disabled');
+        break;
+      case 'Audio':
+        _runQuickAction('Clean up audio',
+            'Reduce steady background noise and normalize dialogue loudness.');
+        break;
+      case 'Export':
+        _showExport();
+        break;
+      default:
+        break;
+    }
+  }
+
+  Widget _panelNav(IconData icon, String label, String? count) => ListTile(
+      dense: true,
+      leading: Icon(icon, size: 19, color: Colors.white70),
+      title: Text(label, style: const TextStyle(fontSize: 13)),
+      trailing: count == null
+          ? null
+          : Text(count,
+              style: const TextStyle(color: Colors.white38, fontSize: 11)));
+  Widget _action(IconData icon, String title, String sub,
+          {Widget? trailing, VoidCallback? onTap}) =>
+      ListTile(
+          dense: true,
+          onTap: onTap,
+          leading: Icon(icon, color: const Color(0xFFB8F36B), size: 19),
+          title: Text(title,
+              style:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+          subtitle: Text(sub,
+              style: const TextStyle(fontSize: 10, color: Colors.white38)),
+          trailing: trailing);
+  Widget _slider(String name, double value) => Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4),
+      child: Column(children: [
+        Row(children: [
+          Expanded(
+              child: Text(name,
+                  style: const TextStyle(fontSize: 11, color: Colors.white70))),
+          Text('${((_adjustments[name] ?? value) * 100).round()}',
+              style: const TextStyle(fontSize: 10, color: Colors.white38))
+        ]),
+        SizedBox(
+            height: 22,
+            child: Slider(
+                value: _adjustments[name] ?? value,
+                onChanged: (next) {
+                  setState(() => _adjustments[name] = next);
+                  _scheduleAutosave();
+                },
+                activeColor: const Color(0xFFB8F36B)))
+      ]));
+  Widget _tag(IconData icon, String text) => Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: .45),
+          borderRadius: BorderRadius.circular(20)),
+      child: Row(children: [
+        Icon(icon, size: 13, color: const Color(0xFFB8F36B)),
+        const SizedBox(width: 6),
+        Text(text, style: const TextStyle(fontSize: 10))
+      ]));
+  void _toast(String message) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 2)));
+
+  void _insertToTimeline(int mediaIndex) {
+    _recordUndo();
+    setState(() {
+      _timelineMedia.add(mediaIndex);
+      _captionSegments.clear();
+      _selectedClip = _timelineMedia.length - 1;
+    });
+    _toast('Added ${_media[mediaIndex].name} to the timeline');
+    _loadPreview(_selectedClip);
+  }
+
+  void _moveSelectedClip(int direction) {
+    final destination = _selectedClip + direction;
+    if (_selectedClip < 0 ||
+        destination < 0 ||
+        destination >= _timelineMedia.length) {
+      return;
+    }
+    _recordUndo();
+    setState(() {
+      final clip = _timelineMedia.removeAt(_selectedClip);
+      _timelineMedia.insert(destination, clip);
+      _captionSegments.clear();
+      _selectedClip = destination;
+    });
+  }
+
+  void _removeSelectedClip() {
+    if (_selectedClip < 0 || _selectedClip >= _timelineMedia.length) return;
+    _recordUndo();
+    setState(() {
+      _timelineMedia.removeAt(_selectedClip);
+      _captionSegments.clear();
+      _selectedClip = _timelineMedia.isEmpty
+          ? -1
+          : _selectedClip.clamp(0, _timelineMedia.length - 1).toInt();
+    });
+    if (_selectedClip >= 0) {
+      _loadPreview(_selectedClip);
+    } else {
+      _previewController?.dispose();
+      setState(() => _previewController = null);
+    }
+  }
+
+  void _recordUndo() {
+    _undoStack.add(_captureTimeline());
+    if (_undoStack.length > 100) _undoStack.removeAt(0);
+    _redoStack.clear();
+    _scheduleAutosave();
+  }
+
+  _TimelineSnapshot _captureTimeline() => _TimelineSnapshot(
+        media: List<int>.of(_timelineMedia),
+        trims: List<RangeValues>.of(_trimRanges),
+        captions: _captionSegments
+            .map((segment) => Map<String, dynamic>.of(segment))
+            .toList(),
+        selectedClip: _selectedClip,
+        musicAssetId: _musicAssetId,
+        musicFileName: _musicFileName,
+        musicVolume: _musicVolume,
+      );
+
+  void _restoreTimeline(_TimelineSnapshot snapshot) {
+    setState(() {
+      _timelineMedia
+        ..clear()
+        ..addAll(snapshot.media);
+      for (var i = 0;
+          i < snapshot.trims.length && i < _trimRanges.length;
+          i++) {
+        _trimRanges[i] = snapshot.trims[i];
+      }
+      _captionSegments
+        ..clear()
+        ..addAll(snapshot.captions.map(Map<String, dynamic>.of));
+      _selectedClip = snapshot.selectedClip;
+      _musicAssetId = snapshot.musicAssetId;
+      _musicFileName = snapshot.musicFileName;
+      _musicVolume = snapshot.musicVolume;
+    });
+    if (_selectedClip >= 0 && _selectedClip < _timelineMedia.length) {
+      _loadPreview(_selectedClip);
+    } else {
+      _previewController?.dispose();
+      _previewController = null;
+    }
+  }
+
+  void _undoTimeline() {
+    if (_undoStack.isEmpty) return;
+    _redoStack.add(_captureTimeline());
+    _restoreTimeline(_undoStack.removeLast());
+  }
+
+  void _redoTimeline() {
+    if (_redoStack.isEmpty) return;
+    _undoStack.add(_captureTimeline());
+    _restoreTimeline(_redoStack.removeLast());
+  }
+
+  String get _backendBaseUrl => Uri.parse(_aiEndpoint)
+      .replace(path: '')
+      .toString()
+      .replaceFirst(RegExp(r'/$'), '');
+  Uri _backendUri(String path) =>
+      Uri.parse(_backendBaseUrl).replace(path: path);
+
+  Map<String, dynamic> _projectData() => {
+        'format': 'cutstudio',
+        'version': 1,
+        'name': _projectName,
+        'savedAt': DateTime.now().toUtc().toIso8601String(),
+        'media': List.generate(
+            _media.length,
+            (index) => {
+                  'assetId': _assetIds[index],
+                  'name': _media[index].name,
+                  'sizeBytes': _media[index].size,
+                  'durationSeconds': _durations[index],
+                  'trimStart': _trimRanges[index].start,
+                  'trimEnd': _trimRanges[index].end,
+                }),
+        'timelineAssetIds':
+            _timelineMedia.map((index) => _assetIds[index]).toList(),
+        'captions': _captionSegments,
+        'musicAssetId': _musicAssetId,
+        'musicFileName': _musicFileName,
+        'musicVolume': _musicVolume,
+        'captionsEnabled': _captions,
+        'removeSilences': _removeSilences,
+        'export': {
+          'resolution': _exportResolution,
+          'aspect': _exportAspect,
+          'captionMode': _captionMode,
+        },
+        'adjustments': _adjustments,
+      };
+
+  void _scheduleAutosave() {
+    if (!_projectReady || !mounted) return;
+    _autosaveTimer?.cancel();
+    setState(() => _projectStatus = 'Unsaved');
+    _autosaveTimer = Timer(const Duration(milliseconds: 800), _persistAutosave);
+  }
+
+  Future<bool> _persistAutosave() async {
+    final running = _autosaveInFlight;
+    if (running != null) {
+      _autosavePending = true;
+      return running;
+    }
+    if (!_projectReady) return false;
+    final operation = _writeAutosave();
+    _autosaveInFlight = operation;
+    final result = await operation;
+    final repeat = _autosavePending;
+    _autosavePending = false;
+    if (identical(_autosaveInFlight, operation)) _autosaveInFlight = null;
+    if (repeat) unawaited(_persistAutosave());
+    return result;
+  }
+
+  Future<bool> _writeAutosave() async {
+    try {
+      final response = await http
+          .put(_backendUri('/api/project/autosave'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode(_projectData()))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('Backend could not store the recovery copy.');
+      }
+      if (mounted) setState(() => _projectStatus = 'Saved');
+      return true;
+    } catch (_) {
+      if (mounted) setState(() => _projectStatus = 'Recovery unavailable');
+      return false;
+    }
+  }
+
+  Future<void> _restoreAutosave() async {
+    var recovered = false;
+    try {
+      final response = await http
+          .get(_backendUri('/api/project/autosave'))
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        final result = jsonDecode(response.body) as Map<String, dynamic>;
+        if (result['found'] == true && result['project'] is Map) {
+          await _applyProjectData(
+              Map<String, dynamic>.from(result['project'] as Map),
+              announce: false);
+          recovered = true;
+        }
+      }
+      if (mounted) setState(() => _projectReady = true);
+      if (recovered) {
+        await _persistAutosave();
+        if (mounted) _toast('Recovered your last Cut Studio session.');
+      } else if (mounted) {
+        setState(() => _projectStatus = 'Saved');
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _projectReady = true;
+          _projectStatus = 'Recovery unavailable';
+        });
+      }
+    }
+  }
+
+  Future<void> _applyProjectData(Map<String, dynamic> project,
+      {String? filePath, bool announce = true}) async {
+    if (project['format'] != 'cutstudio' || project['version'] != 1) {
+      throw Exception('This is not a supported Cut Studio project file.');
+    }
+    final rawMedia = (project['media'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+    final ids = {
+      ...rawMedia.map((item) => item['assetId']).whereType<String>(),
+      if (project['musicAssetId'] is String) project['musicAssetId'] as String,
+    }.toList();
+    final validationResponse = await http
+        .post(_backendUri('/api/media/validate'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'assetIds': ids,
+              'assets': [
+                ...rawMedia.map((item) => {
+                      'id': item['assetId'],
+                      'name': item['name'],
+                    }),
+                if (project['musicAssetId'] is String)
+                  {
+                    'id': project['musicAssetId'],
+                    'name': project['musicFileName'] ?? ''
+                  },
+              ],
+            }))
+        .timeout(const Duration(seconds: 15));
+    final validation = jsonDecode(validationResponse.body);
+    if (validationResponse.statusCode < 200 ||
+        validationResponse.statusCode >= 300) {
+      throw Exception(validation is Map
+          ? validation['error']
+          : 'Could not locate project media.');
+    }
+    final available = (validation['available'] as List? ?? const [])
+        .whereType<String>()
+        .toSet();
+    final indexById = <String, int>{};
+    final nextMedia = <PlatformFile>[];
+    final nextAssetIds = <String>[];
+    final nextDurations = <double>[];
+    final nextTrims = <RangeValues>[];
+    for (final item in rawMedia) {
+      final id = item['assetId'];
+      if (id is! String || !available.contains(id)) continue;
+      final duration = (item['durationSeconds'] as num?)?.toDouble() ?? .1;
+      final safeDuration = duration.isFinite && duration > .1 ? duration : .1;
+      final start = ((item['trimStart'] as num?)?.toDouble() ?? 0)
+          .clamp(0, safeDuration - .1)
+          .toDouble();
+      final end = ((item['trimEnd'] as num?)?.toDouble() ?? safeDuration)
+          .clamp(start + .1, safeDuration)
+          .toDouble();
+      indexById[id] = nextMedia.length;
+      nextAssetIds.add(id);
+      nextMedia.add(PlatformFile(
+          name: (item['name'] as String?) ?? 'Recovered media',
+          size: (item['sizeBytes'] as num?)?.toInt() ?? 0));
+      nextDurations.add(safeDuration);
+      nextTrims.add(RangeValues(start, end > start ? end : safeDuration));
+    }
+    final timelineIds =
+        (project['timelineAssetIds'] as List? ?? const []).whereType<String>();
+    final nextTimeline =
+        timelineIds.map((id) => indexById[id]).whereType<int>().toList();
+    final nextCaptions = (project['captions'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .where((item) =>
+            item['start'] is num &&
+            item['end'] is num &&
+            item['text'] is String)
+        .toList();
+    final rawExport = project['export'] is Map
+        ? Map<String, dynamic>.from(project['export'] as Map)
+        : <String, dynamic>{};
+    final rawAdjustments = project['adjustments'] is Map
+        ? Map<String, dynamic>.from(project['adjustments'] as Map)
+        : <String, dynamic>{};
+    final missingCount = ids.length - available.length;
+    if (!mounted) return;
+    setState(() {
+      _media
+        ..clear()
+        ..addAll(nextMedia);
+      _assetIds
+        ..clear()
+        ..addAll(nextAssetIds);
+      _durations
+        ..clear()
+        ..addAll(nextDurations);
+      _trimRanges
+        ..clear()
+        ..addAll(nextTrims);
+      _timelineMedia
+        ..clear()
+        ..addAll(nextTimeline);
+      _captionSegments
+        ..clear()
+        ..addAll(nextCaptions);
+      _musicAssetId = available.contains(project['musicAssetId'])
+          ? project['musicAssetId'] as String?
+          : null;
+      _musicFileName =
+          _musicAssetId == null ? null : project['musicFileName'] as String?;
+      _musicVolume = ((project['musicVolume'] as num?)?.toDouble() ?? .18)
+          .clamp(0, 1)
+          .toDouble();
+      _captions = project['captionsEnabled'] as bool? ?? true;
+      _removeSilences = project['removeSilences'] as bool? ?? false;
+      _exportResolution =
+          ['720p', '1080p', '4K'].contains(rawExport['resolution'])
+              ? rawExport['resolution'] as String
+              : '1080p';
+      _exportAspect = ['16:9', '9:16', '1:1'].contains(rawExport['aspect'])
+          ? rawExport['aspect'] as String
+          : '16:9';
+      _captionMode = ['soft', 'burned'].contains(rawExport['captionMode'])
+          ? rawExport['captionMode'] as String
+          : 'soft';
+      for (final key in _adjustments.keys.toList()) {
+        final value = rawAdjustments[key];
+        if (value is num && value.toDouble().isFinite) {
+          _adjustments[key] = value.toDouble().clamp(0, 1).toDouble();
+        }
+      }
+      _projectName = (project['name'] as String?)?.trim().isNotEmpty == true
+          ? (project['name'] as String).trim()
+          : 'Untitled project';
+      _projectFilePath = filePath;
+      _selectedClip = _timelineMedia.isEmpty ? -1 : 0;
+      _undoStack.clear();
+      _redoStack.clear();
+      _projectStatus = 'Saved';
+      _projectReady = true;
+    });
+    if (_selectedClip >= 0) await _loadPreview(_selectedClip);
+    await _persistAutosave();
+    if (announce && mounted) {
+      _toast(missingCount > 0
+          ? 'Opened project. $missingCount media file(s) are missing from this backend.'
+          : 'Project opened.');
+    }
+  }
+
+  Future<void> _handleProjectMenu(_ProjectMenuAction action) async {
+    switch (action) {
+      case _ProjectMenuAction.newProject:
+        await _newProject();
+        return;
+      case _ProjectMenuAction.open:
+        await _openProject();
+        return;
+      case _ProjectMenuAction.save:
+      case _ProjectMenuAction.saveAs:
+        await _saveProject(saveAs: action == _ProjectMenuAction.saveAs);
+        return;
+      case _ProjectMenuAction.rename:
+        await _renameProject();
+        return;
+    }
+  }
+
+  Future<bool> _confirmReplaceProject() async {
+    if (_media.isEmpty && _musicAssetId == null) return true;
+    _autosaveTimer?.cancel();
+    final recoveryReady = await _persistAutosave();
+    if (!mounted) return false;
+    return await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) => AlertDialog(
+                  title: const Text('Replace the open project?'),
+                  content: Text(recoveryReady
+                      ? 'Your current session has a recovery copy. Opening another project replaces that copy. Save a .cutstudio project file if you want to keep this edit.'
+                      : 'The recovery copy could not be saved. Opening another project will replace the current session. Save a .cutstudio project file first if you need to keep it.'),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(dialogContext, false),
+                        child: const Text('Cancel')),
+                    FilledButton(
+                        onPressed: () => Navigator.pop(dialogContext, true),
+                        child: const Text('Continue')),
+                  ],
+                )) ??
+        false;
+  }
+
+  Future<void> _newProject() async {
+    if (!await _confirmReplaceProject() || !mounted) return;
+    _previewController?.dispose();
+    setState(() {
+      _previewController = null;
+      _media.clear();
+      _assetIds.clear();
+      _durations.clear();
+      _trimRanges.clear();
+      _timelineMedia.clear();
+      _captionSegments.clear();
+      _musicAssetId = null;
+      _musicFileName = null;
+      _musicVolume = .18;
+      _captions = true;
+      _removeSilences = false;
+      _exportResolution = '1080p';
+      _exportAspect = '16:9';
+      _captionMode = 'soft';
+      _adjustments
+        ..['Exposure'] = .58
+        ..['Contrast'] = .64
+        ..['Saturation'] = .71;
+      _selectedClip = -1;
+      _projectName = 'Untitled project';
+      _projectFilePath = null;
+      _undoStack.clear();
+      _redoStack.clear();
+    });
+    _scheduleAutosave();
+  }
+
+  Future<void> _saveProject({bool saveAs = false}) async {
+    if (_projectBusy) return;
+    final previousStatus = _projectStatus;
+    setState(() {
+      _projectBusy = true;
+      _projectStatus = 'Saving…';
+    });
+    try {
+      final suggestedName =
+          '${_projectName.replaceAll(RegExp(r'[^\w -]'), '').trim().replaceAll(' ', '-')}.cutstudio';
+      final currentParts =
+          _projectFilePath?.split(RegExp(r'[/\\]')) ?? const <String>[];
+      final currentDirectory = _projectFilePath?.substring(
+          0, _projectFilePath!.lastIndexOf(RegExp(r'[/\\]')));
+      final projectBytes =
+          Uint8List.fromList(utf8.encode(jsonEncode(_projectData())));
+      if (!saveAs &&
+          _projectFilePath != null &&
+          project_storage.supportsDirectProjectWrite) {
+        await project_storage.writeProjectFile(_projectFilePath!, projectBytes);
+        await _persistAutosave();
+        if (mounted) _toast('Saved ${currentParts.last}.');
+        return;
+      }
+      final selectedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Cut Studio project',
+        fileName: !saveAs && currentParts.isNotEmpty
+            ? currentParts.last
+            : suggestedName == '.cutstudio'
+                ? 'Untitled.cutstudio'
+                : suggestedName,
+        initialDirectory: !saveAs ? currentDirectory : null,
+        type: FileType.custom,
+        allowedExtensions: const ['cutstudio'],
+        bytes: projectBytes,
+        lockParentWindow: true,
+      );
+      if (selectedPath == null || !mounted) {
+        if (mounted) setState(() => _projectStatus = previousStatus);
+        return;
+      }
+      await project_storage.writeProjectFile(selectedPath, projectBytes);
+      final filename = selectedPath.split(RegExp(r'[/\\]')).last;
+      setState(() {
+        _projectFilePath = selectedPath;
+      });
+      await _persistAutosave();
+      if (mounted) _toast('Saved $filename.');
+    } catch (error) {
+      if (mounted) {
+        _showError('Project could not be saved',
+            error.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) setState(() => _projectBusy = false);
+    }
+  }
+
+  Future<void> _openProject() async {
+    if (_projectBusy) return;
+    try {
+      final selection = await FilePicker.platform.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: const ['cutstudio'],
+          withData: true,
+          lockParentWindow: true);
+      if (selection == null || selection.files.isEmpty || !mounted) return;
+      if (!await _confirmReplaceProject() || !mounted) return;
+      final file = selection.files.first;
+      final bytes = file.bytes;
+      if (bytes == null) {
+        throw Exception('The selected project file could not be read.');
+      }
+      if (bytes.length > 50000000) {
+        throw Exception('Project files must be smaller than 50 MB.');
+      }
+      setState(() {
+        _projectBusy = true;
+        _projectStatus = 'Opening…';
+      });
+      final project = jsonDecode(utf8.decode(bytes));
+      if (project is! Map) {
+        throw Exception('The selected file is not a valid Cut Studio project.');
+      }
+      await _applyProjectData(Map<String, dynamic>.from(project),
+          filePath: file.path);
+    } catch (error) {
+      if (mounted) {
+        setState(() => _projectStatus = 'Unsaved');
+        _showError('Project could not be opened',
+            error.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) setState(() => _projectBusy = false);
+    }
+  }
+
+  Future<void> _renameProject() async {
+    final controller = TextEditingController(text: _projectName);
+    final name = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+              title: const Text('Rename project'),
+              content: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  maxLength: 80,
+                  decoration: const InputDecoration(labelText: 'Project name')),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('Cancel')),
+                FilledButton(
+                    onPressed: () =>
+                        Navigator.pop(dialogContext, controller.text.trim()),
+                    child: const Text('Rename')),
+              ],
+            ));
+    controller.dispose();
+    if (name == null || name.isEmpty || !mounted) return;
+    setState(() => _projectName = name);
+    _scheduleAutosave();
+  }
 
   Future<void> _importMedia() async {
-    final selection = await FilePicker.platform.pickFiles(
-      type: FileType.video,
-      allowMultiple: true,
-    );
+    if (!_projectReady) {
+      _toast('Wait for project recovery to finish before importing media.');
+      return;
+    }
+    if (_mediaBusy) return;
+    final selection = await FilePicker.platform
+        .pickFiles(type: FileType.video, allowMultiple: true, withData: true);
     if (selection == null || !mounted) return;
-    setState(() {
-      _media.addAll(selection.files);
-      _selectedClip = _media.length - selection.files.length;
-    });
-    _toast('Added ${selection.files.length} video${selection.files.length == 1 ? '' : 's'} to your media bin');
+    setState(() => _mediaBusy = true);
+    var imported = 0;
+    try {
+      for (final file in selection.files) {
+        final bytes = file.bytes;
+        if (bytes == null) {
+          throw Exception(
+              'Could not read ${file.name}. Try selecting it again.');
+        }
+        final request = http.MultipartRequest(
+            'POST', _backendUri('/api/media/import'))
+          ..files.add(
+              http.MultipartFile.fromBytes('file', bytes, filename: file.name));
+        final streamed =
+            await request.send().timeout(const Duration(minutes: 5));
+        final response = await http.Response.fromStream(streamed);
+        final result = jsonDecode(response.body);
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception(result['error'] ?? 'Import failed for ${file.name}.');
+        }
+        final metadata = result as Map<String, dynamic>;
+        if (!mounted) return;
+        _recordUndo();
+        setState(() {
+          final index = _media.length;
+          _media.add(
+              PlatformFile(name: file.name, size: file.size, path: file.path));
+          _assetIds.add(metadata['id'] as String);
+          final duration = (metadata['duration'] as num?)?.toDouble() ?? 0;
+          _durations.add(duration);
+          _trimRanges.add(RangeValues(0, duration > .1 ? duration : .1));
+          _timelineMedia.add(index);
+          _captionSegments.clear();
+          _selectedClip = _timelineMedia.length - 1;
+        });
+        imported++;
+        await _loadPreview(_selectedClip);
+      }
+      _toast(
+          'Imported $imported video${imported == 1 ? '' : 's'} and added to timeline');
+    } catch (error) {
+      if (mounted) {
+        _showError('Media import failed',
+            error.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) setState(() => _mediaBusy = false);
+    }
+  }
+
+  Future<void> _importAudio() async {
+    if (!_projectReady) {
+      _toast('Wait for project recovery to finish before importing audio.');
+      return;
+    }
+    final selection = await FilePicker.platform
+        .pickFiles(type: FileType.audio, withData: true);
+    if (selection == null || selection.files.isEmpty || !mounted) return;
+    final file = selection.files.first;
+    try {
+      final bytes = file.bytes;
+      if (bytes == null) throw Exception('Could not read ${file.name}.');
+      final request = http.MultipartRequest(
+          'POST', _backendUri('/api/media/import'))
+        ..files.add(
+            http.MultipartFile.fromBytes('file', bytes, filename: file.name));
+      final response = await http.Response.fromStream(
+          await request.send().timeout(const Duration(minutes: 5)));
+      final result = jsonDecode(response.body);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(result['error'] ?? 'Audio import failed.');
+      }
+      _recordUndo();
+      setState(() {
+        _musicAssetId = result['id'] as String;
+        _musicFileName = file.name;
+      });
+      _toast('Imported ${file.name} as background music');
+    } catch (error) {
+      if (mounted) {
+        _showError('Audio import failed',
+            error.toString().replaceFirst('Exception: ', ''));
+      }
+    }
   }
 
   String _fileSize(int bytes) {
@@ -246,39 +1527,973 @@ class _EditorScreenState extends State<EditorScreen> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
-  void _generateEdit() {
-    _showSuggestion('Your edit plan', _media.isEmpty
-        ? 'Import your footage first. Then Cut Studio can arrange your clips, tighten the pacing, add captions, and shape the story around your prompt.'
-        : 'Use ${_media.length} imported clip${_media.length == 1 ? '' : 's'} to build a 48 second story. Start with the strongest opening shot, tighten pauses, add captions, and finish on a clean audio fade.');
+  Future<void> _loadPreview(int timelineIndex) async {
+    if (timelineIndex < 0 || timelineIndex >= _timelineMedia.length) return;
+    final mediaIndex = _timelineMedia[timelineIndex];
+    final old = _previewController;
+    _previewController = null;
+    await old?.dispose();
+    final controller = VideoPlayerController.networkUrl(
+        _backendUri('/api/media/${_assetIds[mediaIndex]}'));
+    _previewController = controller;
+    try {
+      await controller.initialize();
+      await controller.setLooping(true);
+      await controller.seekTo(Duration(
+          milliseconds: (_trimRanges[mediaIndex].start * 1000).round()));
+      controller.addListener(() {
+        if (mounted &&
+            identical(_previewController, controller) &&
+            _selectedClip >= 0 &&
+            _selectedClip < _timelineMedia.length) {
+          final trim = _trimRanges[_timelineMedia[_selectedClip]];
+          if (controller.value.isPlaying &&
+              controller.value.position >=
+                  Duration(milliseconds: (trim.end * 1000).round())) {
+            controller
+                .seekTo(Duration(milliseconds: (trim.start * 1000).round()));
+          }
+          setState(() {});
+        }
+      });
+      if (mounted && identical(_previewController, controller)) setState(() {});
+    } catch (error) {
+      await controller.dispose();
+      if (identical(_previewController, controller)) _previewController = null;
+      if (mounted) {
+        _showError('Preview unavailable',
+            'The media backend could not decode this video. $error');
+      }
+    }
   }
 
-  void _showSuggestion(String title, String description) {
-    showDialog<void>(context: context, builder: (context) => AlertDialog(
-      title: Row(children: [const Icon(Icons.auto_awesome, color: Color(0xFFB8F36B)), const SizedBox(width: 10), Text(title)]),
-      content: Text('$description\n\nAI suggestions are previews in this prototype; media processing will be connected in a later build.'),
-      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Got it'))],
-    ));
+  void _selectTimelineClip(int index) {
+    if (index < 0 || index >= _timelineMedia.length) return;
+    setState(() => _selectedClip = index);
+    _loadPreview(index);
+  }
+
+  Future<void> _togglePlayback() async {
+    final controller = _previewController;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (controller.value.isPlaying) {
+      await controller.pause();
+    } else {
+      await controller.play();
+    }
+  }
+
+  String _formatDuration(Duration duration) {
+    final m = duration.inMinutes.remainder(60).toString().padLeft(2, '0'),
+        s = duration.inSeconds.remainder(60).toString().padLeft(2, '0'),
+        t = (duration.inMilliseconds.remainder(1000) / 100).floor();
+    return '$m:$s.$t';
+  }
+
+  void _showError(String title, String message) {
+    showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+                title: Text(title),
+                content: SelectableText(message),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('OK'))
+                ]));
+  }
+
+  void _runQuickAction(String title, String instruction) {
+    _promptController.text = '$title: $instruction';
+    _generateEdit();
+  }
+
+  String? _detectProvider(String key) {
+    if (key.startsWith('sk-ant-')) return 'Anthropic';
+    if (key.startsWith('sk-or-v1-')) return 'OpenRouter';
+    if (key.startsWith('gsk_')) return 'Groq';
+    if (key.startsWith('nvapi-')) return 'NVIDIA NIM';
+    if (RegExp(r'^AIza[\w-]{20,}$').hasMatch(key)) return 'Google Gemini';
+    if (key.startsWith('xai-')) return 'xAI';
+    if (key.startsWith('sk-')) return 'OpenAI';
+    return null;
+  }
+
+  Future<void> _refreshAiModels() async {
+    try {
+      final response = await http
+          .get(_backendUri('/api/ai/models'))
+          .timeout(const Duration(seconds: 20));
+      if (response.statusCode != 200) return;
+      final status = jsonDecode(response.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        _aiMode = status['mode'] as String? ?? 'auto';
+        _selectedModelId = status['modelId'] as String? ?? 'auto';
+        _aiModels = (status['models'] as List? ?? const [])
+            .whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item))
+            .toList();
+        final selected = _aiModels
+            .where((item) => item['id'] == _selectedModelId)
+            .firstOrNull;
+        _providerLabel = selected?['name'] as String? ??
+            (_aiMode == 'auto' ? 'Auto' : 'Local LM Studio');
+      });
+    } catch (_) {
+      if (mounted) setState(() => _providerLabel = 'Backend offline');
+    }
+  }
+
+  Future<void> _setAiSelection(String mode, String modelId) async {
+    setState(() => _modelsBusy = true);
+    try {
+      final response = await http
+          .post(_backendUri('/api/ai/selection'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'mode': mode, 'modelId': modelId}))
+          .timeout(const Duration(seconds: 10));
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(body['error'] ?? 'Could not switch AI models.');
+      }
+      if (mounted) {
+        setState(() {
+          _aiMode = body['mode'] as String? ?? mode;
+          _selectedModelId = body['modelId'] as String? ?? modelId;
+          _aiModels = (body['models'] as List? ?? const [])
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList();
+          _providerLabel = _aiModels
+                  .where((item) => item['id'] == _selectedModelId)
+                  .firstOrNull?['name'] as String? ??
+              'Auto';
+        });
+      }
+    } catch (error) {
+      if (mounted) _toast(error.toString().replaceFirst('Exception: ', ''));
+      await _refreshAiModels();
+    } finally {
+      if (mounted) setState(() => _modelsBusy = false);
+    }
+  }
+
+  Future<void> _setAiMode(String mode) async {
+    if (mode == 'auto') {
+      await _setAiSelection('auto', 'auto');
+      return;
+    }
+    final options = _aiModels
+        .where((item) => item['kind'] == (mode == 'local' ? 'local' : 'byok'))
+        .toList();
+    if (options.isEmpty) {
+      if (mode == 'byok') {
+        await _showAiModelsSettings();
+        return;
+      }
+      await _refreshAiModels();
+      final refreshed =
+          _aiModels.where((item) => item['kind'] == 'local').toList();
+      if (refreshed.isEmpty) {
+        _toast('No local LM Studio models were found.');
+        return;
+      }
+      await _setAiSelection(mode, refreshed.first['id'] as String);
+      return;
+    }
+    await _setAiSelection(mode, options.first['id'] as String);
+  }
+
+  Future<void> _showAiModelsSettings() async {
+    _apiKeyController.clear();
+    _modelNameController.clear();
+    _modelIdController.clear();
+    var detected = _detectProvider(_apiKeyController.text);
+    var busy = false;
+    String? error;
+    await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+            builder: (context, refresh) => AlertDialog(
+                  title: const Text('AI models and provider keys'),
+                  content: SizedBox(
+                      width: 520,
+                      child: SingleChildScrollView(
+                          child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                            Text(
+                                'Mode: ${_aiMode.toUpperCase()} · Active: $_providerLabel',
+                                style: const TextStyle(
+                                    color: Color(0xFFB8F36B),
+                                    fontWeight: FontWeight.w600)),
+                            const SizedBox(height: 8),
+                            const Text(
+                                'Add several provider keys and model IDs. They stay in backend memory and are cleared when it restarts.',
+                                style: TextStyle(
+                                    fontSize: 12, color: Colors.white60)),
+                            const SizedBox(height: 12),
+                            TextField(
+                                controller: _modelNameController,
+                                decoration: const InputDecoration(
+                                    labelText: 'Display name (optional)',
+                                    hintText: 'e.g. Fast local-style edits',
+                                    border: OutlineInputBorder())),
+                            const SizedBox(height: 8),
+                            TextField(
+                                controller: _modelIdController,
+                                decoration: const InputDecoration(
+                                    labelText: 'Model ID (optional)',
+                                    hintText:
+                                        'Leave blank for provider default',
+                                    border: OutlineInputBorder())),
+                            const SizedBox(height: 8),
+                            TextField(
+                                controller: _apiKeyController,
+                                obscureText: true,
+                                autocorrect: false,
+                                enableSuggestions: false,
+                                decoration: const InputDecoration(
+                                    labelText: 'Provider API key',
+                                    hintText: 'Paste an API key',
+                                    border: OutlineInputBorder()),
+                                onChanged: (value) => refresh(() =>
+                                    detected = _detectProvider(value.trim()))),
+                            const SizedBox(height: 6),
+                            Text(
+                                detected == null
+                                    ? 'Supported: OpenAI, Anthropic, Gemini, Groq, NVIDIA NIM, OpenRouter, xAI'
+                                    : 'Detected provider: $detected',
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    color: detected == null
+                                        ? Colors.white54
+                                        : const Color(0xFFB8F36B))),
+                            if (error != null) ...[
+                              const SizedBox(height: 8),
+                              Text(error!,
+                                  style: const TextStyle(
+                                      color: Colors.redAccent, fontSize: 12))
+                            ],
+                            const Divider(height: 24),
+                            const Text('SAVED BYOK MODELS',
+                                style: TextStyle(
+                                    fontSize: 10,
+                                    letterSpacing: 1.2,
+                                    color: Colors.white54,
+                                    fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            ..._aiModels
+                                .where((item) =>
+                                    item['kind'] == 'byok' &&
+                                    item['id'] != 'env-openai')
+                                .map((item) => ListTile(
+                                      dense: true,
+                                      contentPadding: EdgeInsets.zero,
+                                      leading: const Icon(Icons.cloud_outlined,
+                                          size: 18, color: Color(0xFFB8F36B)),
+                                      title: Text(
+                                          item['name'] as String? ??
+                                              item['model'] as String? ??
+                                              'BYOK model',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(fontSize: 12)),
+                                      subtitle: Text(
+                                          '${item['provider'] ?? ''} · ${item['model'] ?? ''}',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(fontSize: 10)),
+                                      trailing: IconButton(
+                                          tooltip: 'Remove model',
+                                          icon: const Icon(Icons.delete_outline,
+                                              size: 17),
+                                          onPressed: busy
+                                              ? null
+                                              : () async {
+                                                  refresh(() {
+                                                    busy = true;
+                                                    error = null;
+                                                  });
+                                                  try {
+                                                    final response = await http
+                                                        .delete(_backendUri(
+                                                            '/api/ai/models/${item['id']}'))
+                                                        .timeout(const Duration(
+                                                            seconds: 10));
+                                                    final body = jsonDecode(
+                                                            response.body)
+                                                        as Map<String, dynamic>;
+                                                    if (response.statusCode <
+                                                            200 ||
+                                                        response.statusCode >=
+                                                            300) {
+                                                      throw Exception(body[
+                                                              'error'] ??
+                                                          'Could not remove model.');
+                                                    }
+                                                    if (mounted) {
+                                                      setState(() {
+                                                        _aiMode = body['mode']
+                                                                as String? ??
+                                                            'auto';
+                                                        _selectedModelId = body[
+                                                                    'modelId']
+                                                                as String? ??
+                                                            'auto';
+                                                        _aiModels = (body[
+                                                                        'models']
+                                                                    as List? ??
+                                                                const [])
+                                                            .whereType<Map>()
+                                                            .map((entry) => Map<
+                                                                    String,
+                                                                    dynamic>.from(
+                                                                entry))
+                                                            .toList();
+                                                      });
+                                                    }
+                                                    refresh(() => busy = false);
+                                                  } catch (e) {
+                                                    refresh(() {
+                                                      error = e
+                                                          .toString()
+                                                          .replaceFirst(
+                                                              'Exception: ',
+                                                              '');
+                                                      busy = false;
+                                                    });
+                                                  }
+                                                }),
+                                    )),
+                            if (!_aiModels.any((item) =>
+                                item['kind'] == 'byok' &&
+                                item['id'] != 'env-openai'))
+                              const Padding(
+                                  padding: EdgeInsets.symmetric(vertical: 8),
+                                  child: Text('No app-added BYOK models yet.',
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.white38))),
+                          ]))),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(dialogContext),
+                        child: const Text('Cancel')),
+                    FilledButton(
+                        onPressed: busy ||
+                                detected == null ||
+                                _apiKeyController.text.trim().isEmpty
+                            ? null
+                            : () async {
+                                refresh(() {
+                                  busy = true;
+                                  error = null;
+                                });
+                                try {
+                                  final response = await http
+                                      .post(_backendUri('/api/ai/models'),
+                                          headers: {
+                                            'Content-Type': 'application/json'
+                                          },
+                                          body: jsonEncode({
+                                            'apiKey':
+                                                _apiKeyController.text.trim(),
+                                            'name': _modelNameController.text
+                                                .trim(),
+                                            'model':
+                                                _modelIdController.text.trim()
+                                          }))
+                                      .timeout(const Duration(seconds: 10));
+                                  final body = jsonDecode(response.body);
+                                  if (response.statusCode < 200 ||
+                                      response.statusCode >= 300) {
+                                    throw Exception(body is Map
+                                        ? body['error'] ??
+                                            'Could not add the model.'
+                                        : 'Could not add the model.');
+                                  }
+                                  final status = body as Map<String, dynamic>;
+                                  _apiKeyController.clear();
+                                  _modelNameController.clear();
+                                  _modelIdController.clear();
+                                  if (mounted) {
+                                    setState(() {
+                                      _aiMode =
+                                          status['mode'] as String? ?? 'byok';
+                                      _selectedModelId =
+                                          status['modelId'] as String? ??
+                                              'auto';
+                                      _aiModels = (status['models'] as List? ??
+                                              const [])
+                                          .whereType<Map>()
+                                          .map((item) =>
+                                              Map<String, dynamic>.from(item))
+                                          .toList();
+                                      _providerLabel =
+                                          status['model']?['name'] as String? ??
+                                              'BYOK model';
+                                    });
+                                  }
+                                  detected = null;
+                                  refresh(() {
+                                    busy = false;
+                                  });
+                                } catch (e) {
+                                  refresh(() {
+                                    error = e
+                                        .toString()
+                                        .replaceFirst('Exception: ', '');
+                                    busy = false;
+                                  });
+                                }
+                              },
+                        child: Text(busy ? 'Adding…' : 'Add model')),
+                  ],
+                )));
+    _apiKeyController.clear();
+    _modelNameController.clear();
+    _modelIdController.clear();
+  }
+
+  Future<void> _generateEdit() async {
+    if (_aiBusy || _applyingAiEdits) return;
+    setState(() {
+      _aiBusy = true;
+      _editorAction = 'Reading your brief and reviewing the timeline…';
+    });
+    final prompt = _promptController.text.trim().isEmpty
+        ? 'Create a polished story from these clips.'
+        : _promptController.text.trim();
+    final clips = _timelineMedia
+        .map((i) => {
+              'assetId': _assetIds[i],
+              'name': _media[i].name,
+              'sizeBytes': _media[i].size,
+              'durationSeconds': _durations[i],
+              'trimStart': _trimRanges[i].start,
+              'trimEnd': _trimRanges[i].end,
+            })
+        .toList();
+    try {
+      final response = await http
+          .post(
+            Uri.parse(_aiEndpoint),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'prompt': prompt,
+              'clips': clips,
+              'captionsEnabled': _captions,
+              'aiMode': _aiMode,
+              'modelId': _selectedModelId
+            }),
+          )
+          .timeout(const Duration(minutes: 5));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final body = jsonDecode(response.body);
+        throw Exception(body is Map
+            ? (body['error'] ?? 'AI request failed')
+            : 'AI request failed');
+      }
+      final plan = jsonDecode(response.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() => _editorAction = null);
+      showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+                title: Row(children: [
+                  Image.asset('assets/cut_studio_icon.png',
+                      width: 26, height: 26),
+                  const SizedBox(width: 10),
+                  Expanded(
+                      child: Text(plan['title'] as String? ?? 'Your edit plan'))
+                ]),
+                content: SizedBox(
+                    width: 460,
+                    child: SingleChildScrollView(
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                          Text(plan['summary'] as String? ?? ''),
+                          if ((plan['routerReason'] as String?)?.isNotEmpty ==
+                              true) ...[
+                            const SizedBox(height: 8),
+                            Text('Model choice: ${plan['routerReason']}',
+                                style: const TextStyle(
+                                    color: Colors.white54, fontSize: 11)),
+                          ],
+                          const SizedBox(height: 16),
+                          for (final step
+                              in (plan['steps'] as List? ?? const []))
+                            Padding(
+                                padding: const EdgeInsets.only(bottom: 12),
+                                child: Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Container(
+                                          width: 24,
+                                          height: 24,
+                                          alignment: Alignment.center,
+                                          decoration: const BoxDecoration(
+                                              color: Color(0xFF28321F),
+                                              shape: BoxShape.circle),
+                                          child: Text('${step['order']}',
+                                              style: const TextStyle(
+                                                  color: Color(0xFFB8F36B),
+                                                  fontSize: 11))),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                          child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                            Text(step['action'] ?? '',
+                                                style: const TextStyle(
+                                                    fontWeight:
+                                                        FontWeight.w600)),
+                                            const SizedBox(height: 3),
+                                            Text(step['detail'] ?? '',
+                                                style: const TextStyle(
+                                                    color: Colors.white60,
+                                                    fontSize: 12))
+                                          ])),
+                                    ])),
+                          if ((plan['editDecisions'] as List? ?? const [])
+                              .isNotEmpty) ...[
+                            const Divider(),
+                            const Text('SUGGESTED CUTS',
+                                style: TextStyle(
+                                    fontSize: 10,
+                                    letterSpacing: 1.2,
+                                    color: Color(0xFFB8F36B),
+                                    fontWeight: FontWeight.bold)),
+                            for (final decision
+                                in (plan['editDecisions'] as List))
+                              Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Text(
+                                      '${_media[_timelineMedia[decision['clipIndex'] as int]].name}  ${decision['keep'] == false ? '· remove' : '· keep ${((decision['outPoint'] as num) - (decision['inPoint'] as num)).toStringAsFixed(1)}s'}\n${decision['reason']}',
+                                      style: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 11))),
+                          ],
+                          const SizedBox(height: 8),
+                          Text(
+                              plan['engine'] == 'local'
+                                  ? 'Generated locally with ${plan['model'] ?? 'LM Studio'}. This model received clip names and technical metadata, not video images or audio; preview every suggested edit.'
+                                  : 'Generated with ${plan['provider'] ?? _providerLabel}. AI suggestions are based on sampled frames and, when supported and needed, a transcript. Review before applying.',
+                              style: const TextStyle(
+                                  color: Colors.white38, fontSize: 11)),
+                        ]))),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Keep timeline')),
+                  if ((plan['editDecisions'] as List? ?? const []).isNotEmpty)
+                    FilledButton(
+                        onPressed: _applyingAiEdits
+                            ? null
+                            : () {
+                                _applyAiEdits(plan);
+                                Navigator.pop(dialogContext);
+                              },
+                        child: const Text('Apply editor’s cuts'))
+                ],
+              ));
+    } catch (error) {
+      if (!mounted) return;
+      final message = error.toString().replaceFirst('Exception: ', '');
+      showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+                title: const Text('AI edit is unavailable'),
+                content: Text(
+                    '$message\n\nOpen AI provider settings to add a supported API key, or start LM Studio for local AI planning. For a device or deployed app, set AI_API_URL to a backend URL reachable from that device.'),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('OK'))
+                ],
+              ));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _aiBusy = false;
+          if (!_applyingAiEdits) _editorAction = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _applyAiEdits(Map<String, dynamic> plan) async {
+    final decisions = (plan['editDecisions'] as List? ?? const [])
+        .cast<Map<String, dynamic>>();
+    if (decisions.isEmpty || _timelineMedia.isEmpty || _applyingAiEdits) return;
+    _recordUndo();
+    setState(() {
+      _applyingAiEdits = true;
+      _editorAction = 'Walking the timeline and refining each shot…';
+    });
+    final byClip = <int, Map<String, dynamic>>{
+      for (final decision in decisions) decision['clipIndex'] as int: decision
+    };
+    final ordered = List<int>.generate(_timelineMedia.length, (i) => i);
+    ordered.sort((a, b) => ((byClip[a]?['position'] as int?) ?? a)
+        .compareTo((byClip[b]?['position'] as int?) ?? b));
+    final updated = <int>[];
+    for (final clipIndex in ordered) {
+      final decision = byClip[clipIndex];
+      final mediaIndex = _timelineMedia[clipIndex];
+      setState(() {
+        _selectedClip = clipIndex;
+        _editorAction = decision?['keep'] == false
+            ? 'Removing the weak passage from ${_media[mediaIndex].name}…'
+            : 'Reviewing ${_media[mediaIndex].name} and setting its in/out points…';
+      });
+      await _loadPreview(clipIndex);
+      await Future<void>.delayed(const Duration(milliseconds: 260));
+      if (decision?['keep'] == false) continue;
+      if (decision != null) {
+        final low = _trimRanges[mediaIndex].start,
+            high = _trimRanges[mediaIndex].end;
+        final start = ((decision['inPoint'] as num).toDouble())
+            .clamp(low, high)
+            .toDouble();
+        final end = ((decision['outPoint'] as num).toDouble())
+            .clamp(start, high)
+            .toDouble();
+        if (end - start >= .3) {
+          _trimRanges[mediaIndex] = RangeValues(start, end);
+        }
+      }
+      updated.add(mediaIndex);
+    }
+    if (updated.isEmpty) {
+      _toast('AI did not recommend any safe cuts; timeline kept.');
+    } else {
+      setState(() {
+        _editorAction = 'Arranging the rough cut and refreshing captions…';
+        _timelineMedia
+          ..clear()
+          ..addAll(updated);
+        _selectedClip = 0;
+        _captionSegments.clear();
+      });
+      await _loadPreview(0);
+      _toast('Applied the reviewed cuts and rearranged the timeline.');
+    }
+    if (mounted) {
+      setState(() {
+        _applyingAiEdits = false;
+        _editorAction = null;
+      });
+    }
   }
 
   void _showExport() {
-    showDialog<void>(context: context, builder: (context) => AlertDialog(
-      title: const Text('Export video'),
-      content: Column(mainAxisSize: MainAxisSize.min, children: [
-        DropdownButtonFormField<String>(value: '4K', decoration: const InputDecoration(labelText: 'Resolution'), items: ['4K', '1080p', '720p'].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(), onChanged: (_) {}),
-        const SizedBox(height: 12),
-        DropdownButtonFormField<String>(value: 'H.264 (MP4)', decoration: const InputDecoration(labelText: 'Format'), items: ['H.264 (MP4)', 'HEVC (MP4)', 'ProRes (MOV)'].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(), onChanged: (_) {}),
-        const SizedBox(height: 12),
-        const Text('Export rendering will be available when the video render engine is connected.', style: TextStyle(color: Colors.white54, fontSize: 12)),
-      ]),
-      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
-    ));
+    showDialog<void>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+            builder: (context, refresh) => AlertDialog(
+                  title: const Text('Render and quality check'),
+                  content: Column(mainAxisSize: MainAxisSize.min, children: [
+                    DropdownButtonFormField<String>(
+                        initialValue: _exportResolution,
+                        decoration:
+                            const InputDecoration(labelText: 'Resolution'),
+                        items: ['4K', '1080p', '720p']
+                            .map((v) =>
+                                DropdownMenuItem(value: v, child: Text(v)))
+                            .toList(),
+                        onChanged: (v) {
+                          if (v != null) {
+                            setState(() => _exportResolution = v);
+                            _scheduleAutosave();
+                            refresh(() {});
+                          }
+                        }),
+                    DropdownButtonFormField<String>(
+                        initialValue: _exportAspect,
+                        decoration:
+                            const InputDecoration(labelText: 'Aspect ratio'),
+                        items: ['16:9', '9:16', '1:1']
+                            .map((v) =>
+                                DropdownMenuItem(value: v, child: Text(v)))
+                            .toList(),
+                        onChanged: (v) {
+                          if (v != null) {
+                            setState(() => _exportAspect = v);
+                            _scheduleAutosave();
+                            refresh(() {});
+                          }
+                        }),
+                    DropdownButtonFormField<String>(
+                        initialValue: _captionMode,
+                        decoration:
+                            const InputDecoration(labelText: 'Caption format'),
+                        items: const [
+                          DropdownMenuItem(
+                              value: 'soft',
+                              child: Text('Selectable subtitles')),
+                          DropdownMenuItem(
+                              value: 'burned',
+                              child: Text('Burned into picture'))
+                        ],
+                        onChanged: (v) {
+                          if (v != null) {
+                            setState(() => _captionMode = v);
+                            _scheduleAutosave();
+                            refresh(() {});
+                          }
+                        }),
+                    if (_musicAssetId != null)
+                      Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Column(children: [
+                            Row(children: [
+                              Expanded(
+                                  child: Text(
+                                      'Music: ${_musicFileName ?? 'Imported audio'}',
+                                      overflow: TextOverflow.ellipsis)),
+                              IconButton(
+                                  onPressed: () {
+                                    _recordUndo();
+                                    setState(() => _musicAssetId = null);
+                                    _scheduleAutosave();
+                                    refresh(() {});
+                                  },
+                                  icon: const Icon(Icons.close, size: 16))
+                            ]),
+                            Row(children: [
+                              const Text('Music level',
+                                  style: TextStyle(fontSize: 11)),
+                              Expanded(
+                                  child: Slider(
+                                      value: _musicVolume,
+                                      min: 0,
+                                      max: 1,
+                                      onChangeStart: (_) => _recordUndo(),
+                                      onChanged: (v) {
+                                        setState(() => _musicVolume = v);
+                                        _scheduleAutosave();
+                                        refresh(() {});
+                                      }))
+                            ])
+                          ])),
+                    const SizedBox(height: 12),
+                    Text(_renderBusy
+                        ? 'Rendering, normalizing audio, and checking output…'
+                        : 'Cuts are applied in order. The export uses H.264/AAC, your trim and color settings, audio leveling, and generated captions.'),
+                  ]),
+                  actions: [
+                    TextButton(
+                        onPressed: _renderBusy
+                            ? null
+                            : () => Navigator.pop(dialogContext),
+                        child: const Text('Cancel')),
+                    FilledButton.icon(
+                        onPressed: _renderBusy
+                            ? null
+                            : () async {
+                                await _renderProject();
+                                if (context.mounted) {
+                                  Navigator.pop(dialogContext);
+                                }
+                              },
+                        icon: Icon(_renderBusy
+                            ? Icons.hourglass_top
+                            : Icons.movie_creation_outlined),
+                        label:
+                            Text(_renderBusy ? 'Rendering…' : 'Render video'))
+                  ],
+                )));
+  }
+
+  Future<void> _renderProject() async {
+    if (_renderBusy) return;
+    if (_timelineMedia.isEmpty) {
+      _showError(
+          'Nothing to export', 'Add at least one video clip to the timeline.');
+      return;
+    }
+    setState(() => _renderBusy = true);
+    try {
+      final clips = _timelineMedia
+          .map((i) => {
+                'assetId': _assetIds[i],
+                'start': _trimRanges[i].start,
+                'end': _trimRanges[i].end,
+                'removeSilences': _removeSilences,
+                'exposure': _adjustments['Exposure'] ?? .58,
+                'contrast': _adjustments['Contrast'] ?? .64,
+                'saturation': _adjustments['Saturation'] ?? .71,
+              })
+          .toList();
+      final response = await http
+          .post(_backendUri('/api/render'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'clips': clips,
+                'resolution': _exportResolution,
+                'aspect': _exportAspect,
+                'captionMode': _captionMode,
+                'musicAssetId': _musicAssetId,
+                'musicVolume': _musicVolume,
+                'captions': _captions ? _captionSegments : const []
+              }))
+          .timeout(const Duration(minutes: 30));
+      final result = jsonDecode(response.body);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(result['error'] ?? 'Render failed.');
+      }
+      if (!mounted) return;
+      final exportUrl = _backendUri(result['url'] as String);
+      final metadata = result['metadata'] as Map<String, dynamic>;
+      final qc =
+          (result['qc'] as List? ?? const []).cast<Map<String, dynamic>>();
+      showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+                title: const Text('Export complete'),
+                content: SizedBox(
+                    width: 460,
+                    child: SingleChildScrollView(
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                          Text(
+                              '${metadata['width']} × ${metadata['height']} • ${metadata['videoCodec']} • ${_formatDuration(Duration(milliseconds: ((metadata['duration'] as num).toDouble() * 1000).round()))}'),
+                          const SizedBox(height: 14),
+                          const Text('QUALITY CHECK',
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  letterSpacing: 1.2,
+                                  color: Color(0xFFB8F36B),
+                                  fontWeight: FontWeight.bold)),
+                          if (qc.isEmpty)
+                            const Padding(
+                                padding: EdgeInsets.only(top: 8),
+                                child: Text(
+                                    'Passed basic codec, duration, dimensions, and stream checks.')),
+                          for (final item in qc)
+                            ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                leading: Icon(
+                                    item['severity'] == 'error'
+                                        ? Icons.error_outline
+                                        : item['severity'] == 'warning'
+                                            ? Icons.warning_amber
+                                            : Icons.info_outline,
+                                    color: item['severity'] == 'error'
+                                        ? Colors.redAccent
+                                        : const Color(0xFFB8F36B)),
+                                title: Text(item['message'] as String,
+                                    style: const TextStyle(fontSize: 12))),
+                          const SizedBox(height: 8),
+                          SelectableText(exportUrl.toString(),
+                              style: const TextStyle(
+                                  fontSize: 11, color: Colors.lightBlueAccent)),
+                        ]))),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Close')),
+                  FilledButton.icon(
+                      onPressed: () => launchUrl(exportUrl,
+                          mode: LaunchMode.externalApplication),
+                      icon: const Icon(Icons.download),
+                      label: const Text('Open export'))
+                ],
+              ));
+    } catch (error) {
+      if (mounted) {
+        _showError(
+            'Render failed', error.toString().replaceFirst('Exception: ', ''));
+      }
+    } finally {
+      if (mounted) setState(() => _renderBusy = false);
+    }
+  }
+
+  Future<void> _generateCaptions() async {
+    if (_timelineMedia.isEmpty) {
+      _showError('Add footage first',
+          'Import and place at least one video on the timeline.');
+      return;
+    }
+    try {
+      final segments = <Map<String, dynamic>>[];
+      var offset = 0.0;
+      for (final mediaIndex in _timelineMedia) {
+        final response = await http
+            .post(_backendUri('/api/captions'),
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({'assetId': _assetIds[mediaIndex]}))
+            .timeout(const Duration(minutes: 5));
+        final result = jsonDecode(response.body);
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception(result['error'] ?? 'Caption generation failed.');
+        }
+        final trim = _trimRanges[mediaIndex];
+        for (final segment in (result['segments'] as List? ?? const [])) {
+          final begin = (segment['start'] as num).toDouble(),
+              finish = (segment['end'] as num).toDouble();
+          if (finish > trim.start && begin < trim.end) {
+            segments.add({
+              'start':
+                  offset + (begin - trim.start).clamp(0, trim.end - trim.start),
+              'end': offset +
+                  (finish - trim.start).clamp(0, trim.end - trim.start),
+              'text': segment['text']
+            });
+          }
+        }
+        offset += trim.end - trim.start;
+      }
+      if (!mounted) return;
+      _recordUndo();
+      setState(() {
+        _captions = true;
+        _captionSegments
+          ..clear()
+          ..addAll(segments);
+      });
+      _toast(
+          'Generated ${segments.length} caption segments. Captions will be embedded in the MP4.');
+    } catch (error) {
+      if (mounted) {
+        _showError('Caption generation failed',
+            error.toString().replaceFirst('Exception: ', ''));
+      }
+    }
   }
 }
 
-class _MiniThumbnail extends StatelessWidget {
-  const _MiniThumbnail();
-  @override
-  Widget build(BuildContext context) => ClipRRect(borderRadius: BorderRadius.circular(5), child: Row(children: List.generate(8, (i) => Expanded(child: Container(color: Color.lerp(const Color(0xFF506047), const Color(0xFFB29A69), i / 8)))));
+enum _ProjectMenuAction { newProject, open, save, saveAs, rename }
+
+class _TimelineSnapshot {
+  const _TimelineSnapshot(
+      {required this.media,
+      required this.trims,
+      required this.captions,
+      required this.selectedClip,
+      required this.musicAssetId,
+      required this.musicFileName,
+      required this.musicVolume});
+
+  final List<int> media;
+  final List<RangeValues> trims;
+  final List<Map<String, dynamic>> captions;
+  final int selectedClip;
+  final String? musicAssetId;
+  final String? musicFileName;
+  final double musicVolume;
 }
 
 class _MediaTile extends StatelessWidget {
@@ -286,11 +2501,20 @@ class _MediaTile extends StatelessWidget {
   final IconData icon;
   const _MediaTile({required this.color, required this.icon});
   @override
-  Widget build(BuildContext context) => Container(decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(7)), child: Icon(icon, color: Colors.white70));
+  Widget build(BuildContext context) => Container(
+      decoration:
+          BoxDecoration(color: color, borderRadius: BorderRadius.circular(7)),
+      child: Icon(icon, color: Colors.white70));
 }
 
 class _PreviewFallback extends StatelessWidget {
   const _PreviewFallback();
   @override
-  Widget build(BuildContext context) => const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.ondemand_video, size: 50, color: Colors.white30), SizedBox(height: 10), Text('Add footage to start editing', style: TextStyle(color: Colors.white54))]));
+  Widget build(BuildContext context) => const Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.ondemand_video, size: 50, color: Colors.white30),
+        SizedBox(height: 10),
+        Text('Add footage to start editing',
+            style: TextStyle(color: Colors.white54))
+      ]));
 }
