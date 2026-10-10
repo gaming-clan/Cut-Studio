@@ -81,4 +81,26 @@ Do not place provider keys in Flutter source or a mobile app bundle. BYOK settin
 
 With a provider key, the AI planner samples two frames from each timeline clip and can transcribe speech when a request asks about dialogue, quotes, captions, or a transcript (OpenAI and Groq only). Without a provider key, it calls the installed LM Studio model through `lms chat` and returns a text-only suggestion grounded in filenames and FFprobe metadata. To use a local vision model, set `LM_STUDIO_API_TOKEN`; the backend then sends sampled frames to the LM Studio OpenAI-compatible local API. The text-only mode does not invent trims or pretend to see footage. Review any vision-based cut proposal before applying it.
 
-The AI planner follows an editorial pass: read the brief, inspect available clip evidence, form a rough story arc, propose trims and clip order, then list finishing and delivery checks. Applying the plan visibly steps through the clips, previews each one, applies supported trims/removals/reordering, and refreshes the timeline. It presents advice for color, audio, captions, or transitions as review steps when those changes are not directly represented by timeline operations; it does not claim they have been applied. The broader render workflow follows the supplied production guide: inspect source stream properties; preserve originals in the uploads area; normalize picture and audio; choose framing and caption format; encode to a delivery profile; then check output metadata and review playback around cuts, captions, sync, picture, and sound. Technical QC cannot judge whether the story or color treatment is editorially right. Uploaded sources remain separate from generated exports.
+
+## Editing controls and current scope
+
+- Timeline clips can be selected, reordered, removed, and trimmed. The toolbar's undo and redo buttons retain up to 100 timeline states, including clip order, trim ranges, caption segments, and the background music selection/level. A new edit clears the redo history.
+- Use the folder menu beside the project name to create, rename, save, and reopen `.cutstudio` project files. The app autosaves changes to the local backend and restores the last session when it starts again. The backend stores this recovery file under `backend/data/`; keep that data folder if you want to retain recovery across backend restarts.
+- A `.cutstudio` file stores the edit and references media by local backend asset ID. The backend keeps uploaded media in `backend/data/uploads/`; project files do not embed large video/audio files, so a project opened against another backend needs its media imported there again.
+- The timeline displays only content that exists in the current edit: video clips, generated caption segments, and an imported background music bed. Empty lanes are labeled instead of showing sample clips.
+- Export settings include resolution, aspect ratio, subtitle mode, background music level, picture adjustments, and optional silence removal. Export QC checks technical properties; review the rendered file for story, sync, captions, and sound before delivery.
+
+Cut Studio is still an early editor. The timeline is a single ordered video sequence with one optional music bed; it does not yet support draggable multi-track clips, title or graphics overlays, transitions, sound-effect placement, keyframes, or a full-resolution thumbnail/waveform cache. These are product directions, not implemented features.
+
+## Suggested next features
+
+Prioritized by how much they improve a real editing session:
+
+1. **Media relinking and portable project bundles** — locate source files when an asset ID is unavailable, optionally package media with a project, and show missing-file recovery in a relink dialog.
+2. **Direct timeline manipulation** — drag clips to reorder, split at the playhead, ripple-delete gaps, snap to edit points, and zoom/scroll the sequence.
+3. **A real audio and title workflow** — multiple audio/title tracks, clip-level volume and fades, title cards, and editable transition durations, reflected in preview and export.
+4. **Reviewable AI passes** — show evidence and confidence for each proposed trim, let users accept or reject changes individually, and provide one-click rollback for the whole AI pass.
+5. **Faster media review** — cached contact sheets and audio waveforms, proxy playback for large footage, and background import/transcode progress.
+6. **Finishing and delivery presets** — named export profiles, safe-area guides, loudness targets, caption styling, and a QC report that distinguishes automated checks from human review.
+
+The immediate reliability priorities are media relinking, clearer progress and cancellation for long renders, and exercising import/render/QC on varied codecs and long timelines. Treat an AI plan as a proposal: inspect the footage and approve its cuts before export.

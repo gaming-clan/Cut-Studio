@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -142,6 +142,7 @@ async function resolveAiModel(input,prompt) {
 const dataRoot = path.resolve(process.env.CUT_STUDIO_DATA || 'data');
 const uploadRoot = path.join(dataRoot, 'uploads');
 const exportRoot = path.join(dataRoot, 'exports');
+const autosavePath = path.join(dataRoot, 'autosave.cutstudio.json');
 await mkdir(uploadRoot, { recursive: true });
 await mkdir(exportRoot, { recursive: true });
 
@@ -246,6 +247,19 @@ async function sampleFrames(source, start, end, count = 2) {
 }
 
 const assetMime = new Map();
+const mimeByExtension = {
+  '.mp4':'video/mp4','.m4v':'video/mp4','.mov':'video/quicktime',
+  '.webm':'video/webm','.mkv':'video/x-matroska','.avi':'video/x-msvideo',
+  '.mp3':'audio/mpeg','.wav':'audio/wav','.m4a':'audio/mp4',
+  '.aac':'audio/aac','.ogg':'audio/ogg',
+};
+for (const name of await readdir(uploadRoot)) {
+  if (!name.endsWith('.meta.json')) continue;
+  try {
+    const metadata = JSON.parse(await readFile(path.join(uploadRoot, name), 'utf8'));
+    if (/^[a-f0-9-]{36}$/.test(metadata.id) && typeof metadata.mimeType === 'string') assetMime.set(metadata.id, metadata.mimeType);
+  } catch { /* Ignore incomplete metadata; media validation will still detect the asset. */ }
+}
 const schema = {
   type: 'object', additionalProperties: false, required: ['title', 'summary', 'steps', 'editDecisions'],
   properties: {
@@ -271,10 +285,47 @@ const server = createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin',origin); res.setHeader('Vary','Origin');
   } else if(origin) { res.writeHead(403).end('Origin not allowed'); return; }
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify({ok: true, ...providerStatus(), localModel})); return;
+  }
+  if (req.method === 'GET' && req.url === '/api/project/autosave') {
+    try {
+      const contents = await readFile(autosavePath, 'utf8');
+      sendJson(res, 200, {found:true, project:JSON.parse(contents)}); return;
+    } catch (error) {
+      if (error.code === 'ENOENT') { sendJson(res, 200, {found:false}); return; }
+      sendJson(res, 500, {error:'The autosaved project could not be read.'}); return;
+    }
+  }
+  if (req.method === 'PUT' && req.url === '/api/project/autosave') {
+    try {
+      const project = await readJson(req, 50_000_000);
+      if (project?.format !== 'cutstudio' || project?.version !== 1 || !Array.isArray(project.media) || !Array.isArray(project.timelineAssetIds)) {
+        sendJson(res, 422, {error:'Unsupported or invalid Cut Studio project data.'}); return;
+      }
+      const temporary = `${autosavePath}.${randomUUID()}.tmp`;
+      await writeFile(temporary, JSON.stringify(project), 'utf8');
+      await rename(temporary, autosavePath);
+      sendJson(res, 200, {ok:true}); return;
+    } catch (error) { sendJson(res, 400, {error:error.message || 'Could not autosave the project.'}); return; }
+  }
+  if (req.method === 'POST' && req.url === '/api/media/validate') {
+    try {
+      const input = await readJson(req, 100_000), ids = Array.isArray(input.assetIds) ? input.assetIds.slice(0, 500) : [];
+      const names = new Map((Array.isArray(input.assets) ? input.assets : []).filter(item => item && typeof item.id === 'string' && typeof item.name === 'string').map(item => [item.id, item.name]));
+      const results = await Promise.all(ids.map(async id => {
+        try {
+          await stat(assetPath(id));
+          const mime = mimeByExtension[path.extname(names.get(id) || '').toLowerCase()];
+          if (mime) assetMime.set(id, mime);
+          return {id, available:true};
+        }
+        catch { return {id, available:false}; }
+      }));
+      sendJson(res, 200, {available:results.filter(item => item.available).map(item => item.id), missing:results.filter(item => !item.available).map(item => item.id)}); return;
+    } catch (error) { sendJson(res, 400, {error:error.message || 'Could not validate project media.'}); return; }
   }
   if (req.url === '/api/ai/models' && req.method === 'GET') {
     sendJson(res,200,{...aiSelection,models:await modelCatalog()}); return;
@@ -338,8 +389,7 @@ const server = createServer(async (req, res) => {
       bb.on('file', (_field, stream, info) => {
         filename = path.basename(info.filename || 'video').slice(0,180);
         const ext=path.extname(filename).toLowerCase();
-        const mimeByExt={'.mp4':'video/mp4','.m4v':'video/mp4','.mov':'video/quicktime','.webm':'video/webm','.mkv':'video/x-matroska','.avi':'video/x-msvideo','.mp3':'audio/mpeg','.wav':'audio/wav','.m4a':'audio/mp4','.aac':'audio/aac','.ogg':'audio/ogg'};
-        assetMime.set(id, mimeByExt[ext] || info.mimeType || 'application/octet-stream');
+        assetMime.set(id, mimeByExtension[ext] || info.mimeType || 'application/octet-stream');
         stream.on('limit', () => { fileError = new Error('Video exceeds the 1 GB upload limit.'); });
         writes.push(pipeline(stream, createWriteStream(file)).catch(error => { fileError = error; }));
       });
@@ -347,6 +397,7 @@ const server = createServer(async (req, res) => {
       await Promise.all(writes);
       if (fileError) { await rm(file,{force:true}); throw fileError; }
       const metadata = await probe(file);
+      await writeFile(path.join(uploadRoot, `${id}.meta.json`), JSON.stringify({id, filename, mimeType:assetMime.get(id), metadata}), 'utf8');
       sendJson(res, 201, {id, filename, ...metadata}); return;
     } catch(error) { sendJson(res, 400, {error:error.message || 'Unable to import video.'}); return; }
   }
